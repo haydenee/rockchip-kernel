@@ -407,23 +407,23 @@ static int __v4l2_fwnode_endpoint_parse(struct fwnode_handle *fwnode,
 	enum v4l2_mbus_type mbus_type;
 	int rval;
 
-	pr_debug("===== begin parsing endpoint %pfw\n", fwnode);
+	pr_info("===== begin parsing endpoint %pfw\n", fwnode);
 
 	fwnode_property_read_u32(fwnode, "bus-type", &bus_type);
-	pr_debug("fwnode video bus type %s (%u), mbus type %s (%u)\n",
+	pr_info("fwnode video bus type %s (%u), mbus type %s (%u)\n",
 		 v4l2_fwnode_bus_type_to_string(bus_type), bus_type,
 		 v4l2_fwnode_mbus_type_to_string(vep->bus_type),
 		 vep->bus_type);
 	mbus_type = v4l2_fwnode_bus_type_to_mbus(bus_type);
 	if (mbus_type == V4L2_MBUS_INVALID) {
-		pr_debug("unsupported bus type %u\n", bus_type);
+		pr_info("unsupported bus type %u\n", bus_type);
 		return -EINVAL;
 	}
 
 	if (vep->bus_type != V4L2_MBUS_UNKNOWN) {
 		if (mbus_type != V4L2_MBUS_UNKNOWN &&
 		    vep->bus_type != mbus_type) {
-			pr_debug("expecting bus type %s\n",
+			pr_info("expecting bus type %s\n",
 				 v4l2_fwnode_mbus_type_to_string(vep->bus_type));
 			return -ENXIO;
 		}
@@ -442,7 +442,7 @@ static int __v4l2_fwnode_endpoint_parse(struct fwnode_handle *fwnode,
 			v4l2_fwnode_endpoint_parse_parallel_bus(fwnode, vep,
 								V4L2_MBUS_UNKNOWN);
 
-		pr_debug("assuming media bus type %s (%u)\n",
+		pr_info("assuming media bus type %s (%u)\n",
 			 v4l2_fwnode_mbus_type_to_string(vep->bus_type),
 			 vep->bus_type);
 
@@ -456,8 +456,14 @@ static int __v4l2_fwnode_endpoint_parse(struct fwnode_handle *fwnode,
 	case V4L2_MBUS_CSI2_CPHY:
 		rval = v4l2_fwnode_endpoint_parse_csi2_bus(fwnode, vep,
 							   vep->bus_type);
+		pr_info("assuming media bus type %s (%u)\n",
+			 v4l2_fwnode_mbus_type_to_string(vep->bus_type),
+			 vep->bus_type);
 		if (rval)
+		{
+			pr_err("failed to parse fwnode endpoint: %d\n", rval);
 			return rval;
+		}
 
 		break;
 	case V4L2_MBUS_PARALLEL:

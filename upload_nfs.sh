@@ -1,0 +1,5 @@
+CCACHE_BASEDIR="/root/orangepi-build/kernel/orange-pi-6.1-rk35xx" env PATH="/root/orangepi-build/toolchains/gcc-arm-11.2-2022.02-x86_64-aarch64-none-linux-gnu/bin:/usr/lib/ccache:/root/.vscode-server/cli/servers/Stable-18e3a1ec544e6907be1e944a94c496e302073435/server/bin/remote-cli:/opt/hisi-linux/x86-arm/aarch64-himix100-linux/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/root/.vscode-server/data/User/globalStorage/github.copilot-chat/debugCommand" make -j36 ARCH=arm64 CROSS_COMPILE="ccache aarch64-none-linux-gnu-"  LOCALVERSION="-rockchip-rk3588" Image dtbs
+mkdir -p /root/nfs/boot/dtb-6.1.43-rockchip-rk3588/rockchip
+mv arch/arm64/boot/dts/rockchip/rk3588s-orangepi-5.dtb /root/nfs/boot/dtb-6.1.43-rockchip-rk3588/rockchip/
+mv arch/arm64/boot/Image /root/nfs/boot
+echo "Upload complete"

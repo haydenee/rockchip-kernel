@@ -1980,10 +1980,12 @@ static void samsung_dcphy_rx_config_settle(struct csi2_dphy *dphy,
 	u32 sot_sync = 0;
 
 	if (sensor->mbus.type == V4L2_MBUS_CSI2_DPHY) {
+		dev_err(dphy->dev, "[HAYDEN] %s: DPHY mode is not supported!\n", __func__);
 		hsfreq_ranges = samsung_dphy_rx_hsfreq_ranges;
 		num_hsfreq_ranges = ARRAY_SIZE(samsung_dphy_rx_hsfreq_ranges);
 		sot_sync = 0x03;
 	} else if (sensor->mbus.type == V4L2_MBUS_CSI2_CPHY) {
+		dev_info(dphy->dev, "[HAYDEN] %s: CPHY mode is good!\n", __func__);
 		hsfreq_ranges = samsung_cphy_rx_hsfreq_ranges;
 		num_hsfreq_ranges = ARRAY_SIZE(samsung_cphy_rx_hsfreq_ranges);
 		sot_sync = 0x32;
@@ -2274,9 +2276,11 @@ static int samsung_dcphy_rx_stream_on(struct csi2_dphy *dphy,
 
 	mutex_lock(&samsung->mutex);
 	if (sensor->mbus.type == V4L2_MBUS_CSI2_CPHY) {
+		dev_info(dphy->dev, "[HAYDEN] %s: CPHY mode is good!\n", __func__);
 		regmap_write(samsung->grf_regmap, MIPI_DCPHY_GRF_CON0, S_CPHY_MODE);
 		samsung->c_option = true;
 	} else {
+		dev_err(dphy->dev, "[HAYDEN] %s: DPHY mode is not desired!!!\n", __func__);
 		samsung->c_option = false;
 	}
 

@@ -934,7 +934,7 @@ static int rockchip_csi2_dphy_fwnode_parse(struct csi2_dphy *dphy)
 	struct v4l2_mbus_config *config = NULL;
 	struct fwnode_handle *remote_ep = NULL;
 	struct v4l2_fwnode_endpoint vep = {
-		.bus_type = V4L2_MBUS_CSI2_DPHY
+		.bus_type = V4L2_MBUS_UNKNOWN,
 	};
 	struct device *remote_dev = NULL;
 	int ret;
@@ -942,7 +942,10 @@ static int rockchip_csi2_dphy_fwnode_parse(struct csi2_dphy *dphy)
 	fwnode_graph_for_each_endpoint(dev_fwnode(dev), ep) {
 		ret = v4l2_fwnode_endpoint_parse(ep, &vep);
 		if (ret)
+		{
+			dev_err(dev, "failed to parse fwnode endpoint: %d\n", ret);
 			goto err_parse;
+		}
 
 		/* only add fwnode form port 0 to notifier list */
 		if (vep.base.port != 0)
@@ -975,6 +978,7 @@ static int rockchip_csi2_dphy_fwnode_parse(struct csi2_dphy *dphy)
 							sensor_async_subdev);
 		if (IS_ERR(s_asd)) {
 			ret = PTR_ERR(s_asd);
+			dev_err(dev, "failed to add fwnode remote: %d\n", ret);
 			goto err_parse;
 		}
 
@@ -984,6 +988,8 @@ static int rockchip_csi2_dphy_fwnode_parse(struct csi2_dphy *dphy)
 			config->type = vep.bus_type;
 			config->bus.mipi_csi2.flags = vep.bus.mipi_csi2.flags;
 			s_asd->lanes = vep.bus.mipi_csi2.num_data_lanes;
+			dev_info(dev, "csi2dphy: bus_type %d, lanes %d\n",
+					vep.bus_type, s_asd->lanes);
 		} else if (vep.bus_type == V4L2_MBUS_CCP2) {
 			/* V4L2_MBUS_CCP2 for lvds */
 			config->type = V4L2_MBUS_CCP2;
@@ -1013,13 +1019,19 @@ static int rockchip_csi2dphy_media_init(struct csi2_dphy *dphy)
 	ret = media_entity_pads_init(&dphy->sd.entity,
 				CSI2_DPHY_RX_PADS_NUM, dphy->pads);
 	if (ret < 0)
+	{
+		dev_err(dphy->dev, "failed to init media entity pads: %d\n", ret);
 		return ret;
+	}
 
 	v4l2_async_nf_init(&dphy->notifier);
 
 	ret = rockchip_csi2_dphy_fwnode_parse(dphy);
 	if (ret)
+	{
+		dev_err(dphy->dev, "failed to parse fwnode: %d\n", ret);
 		return ret;
+	}
 
 	dphy->sd.subdev_notifier = &dphy->notifier;
 	dphy->notifier.ops = &rockchip_csi2_dphy_async_ops;
@@ -1031,7 +1043,14 @@ static int rockchip_csi2dphy_media_init(struct csi2_dphy *dphy)
 		return ret;
 	}
 
-	return v4l2_async_register_subdev(&dphy->sd);
+	ret =  v4l2_async_register_subdev(&dphy->sd);
+	if (ret) {
+		dev_err(dphy->dev, "failed to register subdev: %d\n", ret);
+		v4l2_async_nf_cleanup(&dphy->notifier);
+		return ret;
+	}
+
+	return ret;
 }
 
 static struct dphy_drv_data rk3568_dphy_drv_data = {
@@ -1184,7 +1203,10 @@ static int rockchip_csi2_dphy_probe(struct platform_device *pdev)
 
 	of_id = of_match_device(rockchip_csi2_dphy_match_id, dev);
 	if (!of_id)
+	{
+		dev_err(dev, "failed to match device tree\n");
 		return -EINVAL;
+	}
 	drv_data = of_id->data;
 	csi2dphy->drv_data = drv_data;
 
@@ -1194,7 +1216,11 @@ static int rockchip_csi2_dphy_probe(struct platform_device *pdev)
 
 	ret = rockchip_csi2_dphy_get_hw(csi2dphy);
 	if (ret)
+	{
+		dev_err(dev, "failed to get dphy%d hw, ret %d\n",
+			csi2dphy->phy_index, ret);
 		return -EINVAL;
+	}
 	if (csi2dphy->drv_data->chip_id == CHIP_ID_RK3568 ||
 	    csi2dphy->drv_data->chip_id == CHIP_ID_RV1106) {
 		csi2dphy->csi_info.csi_num = 1;
@@ -1215,7 +1241,11 @@ static int rockchip_csi2_dphy_probe(struct platform_device *pdev)
 
 	ret = rockchip_csi2dphy_media_init(csi2dphy);
 	if (ret < 0)
+	{
+		dev_err(dev, "failed to init media entity for csi2 dphy%d, ret %d\n",
+			csi2dphy->phy_index, ret);
 		goto detach_hw;
+	}
 
 	pm_runtime_enable(&pdev->dev);
 

@@ -190,9 +190,16 @@ static void csi2_enable(struct csi2_hw *csi2_hw,
 
 	csi2_g_mbus_config(&csi2->sd, 0, &mbus);
 	if (mbus.type == V4L2_MBUS_CSI2_DPHY)
+	{
+		v4l2_err(&csi2->sd, "[HAYDEN] %s: DPHY is undesired!!! please use CPHY!\n",
+				__func__);
 		val = SW_CPHY_EN(0);
+	}
 	else if (mbus.type == V4L2_MBUS_CSI2_CPHY)
+	{
+		v4l2_warn(&csi2->sd, "[HAYDEN] %s: CPHY is good!\n", __func__);
 		val = SW_CPHY_EN(1);
+	}
 
 	write_csihost_reg(base, CSIHOST_N_LANES, lanes - 1);
 
