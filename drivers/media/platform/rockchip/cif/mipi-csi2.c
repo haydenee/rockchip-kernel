@@ -575,6 +575,8 @@ void rkcif_csi2_event_inc_sof(struct csi2_dev *csi2_dev)
 				atomic_inc_return(&csi2_dev->frm_sync_seq) - 1,
 		};
 		v4l2_event_queue(csi2_dev->sd.devnode, &event);
+		// dev_info(csi2_dev->dev, "CSI2: Frame SOF #%d\n", 
+        //         event.u.frame_sync.frame_sequence);
 	}
 }
 
@@ -582,7 +584,6 @@ u32 rkcif_csi2_get_sof(struct csi2_dev *csi2_dev)
 {
 	if (csi2_dev)
 		return atomic_read(&csi2_dev->frm_sync_seq) - 1;
-
 	return 0;
 }
 
@@ -830,6 +831,7 @@ static irqreturn_t rk_csirx_irq1_handler(int irq, void *ctx)
 	char cur_str[CSI_ERRSTR_LEN] = {0};
 	char vc_info[CSI_VCINFO_LEN] = {0};
 	bool is_add_cnt = false;
+	// static int normal_irq_count = 0;
 
 	if (!csi2_hw) {
 		disable_irq_nosync(irq);
@@ -928,6 +930,14 @@ static irqreturn_t rk_csirx_irq1_handler(int irq, void *ctx)
 		}
 
 	}
+	// if (val == 0) {
+    //     normal_irq_count++;
+    //     // if (normal_irq_count % 100 == 0) { // 每100个正常中断打印一次
+    //         v4l2_info(&csi2->sd, "[CSI2_DEBUG] Normal data reception - IRQ1 count: %d\n", 
+    //               normal_irq_count);
+    //     // }
+    //     return IRQ_HANDLED;
+    // }
 
 	return IRQ_HANDLED;
 }

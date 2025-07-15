@@ -2333,6 +2333,7 @@ static irqreturn_t rkcif_irq_handler(int irq, struct rkcif_device *cif_dev)
 	} else {
 		rkcif_irq_oneframe(cif_dev);
 	}
+	v4l2_info(&cif_dev->v4l2_dev, "rkcif_irq_handler: IRQ %d\n", irq);
 	return IRQ_HANDLED;
 }
 
@@ -3110,6 +3111,7 @@ static int rkcif_plat_probe(struct platform_device *pdev)
 	const struct rkcif_match_data *data;
 	int ret;
 
+	rkcif_debug = 1;
 	sprintf(rkcif_version, "v%02x.%02x.%02x",
 		RKCIF_DRIVER_VERSION >> 16,
 		(RKCIF_DRIVER_VERSION & 0xff00) >> 8,

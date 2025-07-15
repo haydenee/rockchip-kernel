@@ -1270,7 +1270,7 @@ static const struct hsfreq_range samsung_dphy_rx_hsfreq_ranges[] = {
 
 /* These tables must be sorted by .range_h ascending. */
 static const struct hsfreq_range samsung_cphy_rx_hsfreq_ranges[] = {
-	{ 500,  0x102}, { 990, 0x002}, { 2500, 0x001},
+	{ 250,  0x104}, { 500,  0x102}, { 990, 0x002}, { 2500, 0x001},
 };
 
 static void samsung_mipi_dcphy_bias_block_enable(struct samsung_mipi_dcphy *samsung,
@@ -1985,10 +1985,11 @@ static void samsung_dcphy_rx_config_settle(struct csi2_dphy *dphy,
 		num_hsfreq_ranges = ARRAY_SIZE(samsung_dphy_rx_hsfreq_ranges);
 		sot_sync = 0x03;
 	} else if (sensor->mbus.type == V4L2_MBUS_CSI2_CPHY) {
-		dev_info(dphy->dev, "[HAYDEN] %s: CPHY mode is good!\n", __func__);
 		hsfreq_ranges = samsung_cphy_rx_hsfreq_ranges;
 		num_hsfreq_ranges = ARRAY_SIZE(samsung_cphy_rx_hsfreq_ranges);
 		sot_sync = 0x32;
+		dev_info(dphy->dev, "[HAYDEN] %s: CPHY mode is good! sot_sync=0x%x \n",
+			 __func__, sot_sync);
 	} else {
 		dev_err(dphy->dev, "mbus type %d is not support",
 			sensor->mbus.type);
@@ -1998,6 +1999,8 @@ static void samsung_dcphy_rx_config_settle(struct csi2_dphy *dphy,
 	for (i = 0; i < num_hsfreq_ranges; i++) {
 		if (hsfreq_ranges[i].range_h >= dphy->data_rate_mbps) {
 			hsfreq = hsfreq_ranges[i].cfg_bit;
+			dev_info(dphy->dev, "data rate: %lld mbps, use hsfreq %x\n",
+			 dphy->data_rate_mbps, hsfreq);
 			break;
 		}
 	}
@@ -2007,6 +2010,7 @@ static void samsung_dcphy_rx_config_settle(struct csi2_dphy *dphy,
 		dev_warn(dphy->dev, "data rate: %lld mbps, max support %d mbps",
 			 dphy->data_rate_mbps, hsfreq_ranges[i].range_h + 1);
 		hsfreq = hsfreq_ranges[i].cfg_bit;
+		dev_info(dphy->dev, "use hsfreq %x\n", hsfreq);
 	}
 	/*clk settle fix to 0x301*/
 	if (sensor->mbus.type == V4L2_MBUS_CSI2_DPHY)

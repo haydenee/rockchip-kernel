@@ -54,6 +54,7 @@
 #define IMX858_XVCLK_FREQ		24000000
 
 #define CHIP_ID				0x0858
+#define CHIP_ID2			0x0859
 #define IMX858_REG_CHIP_ID_H		0x0016
 #define IMX858_REG_CHIP_ID_L		0x0017
 
@@ -801,9 +802,15 @@ static int imx858_write_reg(struct i2c_client *client, u16 reg,
 	u8 buf[6];
 	u8 *val_p;
 	__be32 val_be;
+	u32 read_val;
+	int ret;
 
 	if (len > 4)
+	{
+		dev_err(&client->dev,
+			"%s: len > 4", __func__);
 		return -EINVAL;
+	}
 
 	buf[0] = reg >> 8;
 	buf[1] = reg & 0xff;
@@ -816,15 +823,39 @@ static int imx858_write_reg(struct i2c_client *client, u16 reg,
 	while (val_i < 4)
 		buf[buf_i++] = val_p[val_i++];
 
-	if (i2c_master_send(client, buf, len + 2) != len + 2)
+	ret = i2c_master_send(client, buf, len + 2);
+	if (ret != len + 2)
+	{
+		dev_err(&client->dev,
+			"%s: Failed to write register 0x%04x, ret %d, will retry",
+			__func__, reg, ret);
+	}
+	ret = i2c_master_send(client, buf, len + 2);
+	if (ret != len + 2)
+	{
+		dev_err(&client->dev,
+			"%s: Failed to write register 0x%04x, ret %d, will retry",
+			__func__, reg, ret);
+	}
+	ret = i2c_master_send(client, buf, len + 2);
+	if (ret != len + 2)
+	{
+		dev_err(&client->dev,
+			"%s: Failed to write register 0x%04x, ret %d",
+			__func__, reg, ret);
 		return -EIO;
+	}
 
-    // read back to verify
+	// readback
 	if (len == IMX858_REG_VALUE_08BIT) {
-		u32 read_val;
 		int ret = imx858_read_reg(client, reg, len, &read_val);
 		if (ret < 0)
+		{
+			dev_err(&client->dev,
+				"%s: Failed to readback register 0x%04x, ret %d",
+				__func__, reg, ret);
 			return ret;
+		}
 
 		if (read_val != val) {
 			dev_err(&client->dev,
@@ -832,11 +863,23 @@ static int imx858_write_reg(struct i2c_client *client, u16 reg,
 				"expected 0x%02x, read 0x%02x\n",
 				reg, val & 0xff, read_val & 0xff);
 		}
+		else {
+			dev_info(&client->dev,
+				"%s: 0x%04x: 0x%02x\n",
+				__func__, reg, read_val & 0xff);
+		}
 	}else {
         dev_warn(&client->dev,
          "Unverified write to register 0x%04x: "
          "expected 0x%08x\n", reg, val);
     }
+
+	// // we especially care about 0x0100
+	// if (reg == 0x0100) {
+	// 	dev_info(&client->dev,
+	// 		 "IMX858_REG_CTRL_MODE register 0x%04x: 0x%08x 0x%08x\n",
+	// 		 reg, val, read_val);
+	// }
 
 	return 0;
 }
@@ -855,6 +898,7 @@ static int imx858_write_array(struct i2c_client *client,
 					       IMX858_REG_VALUE_08BIT,
 					       regs[i].val);
 
+	dev_err(&client->dev, "%s: i=%d, ret=%d\n", __func__, i, ret);
 	return ret;
 }
 
@@ -1897,7 +1941,12 @@ static int imx858_check_sensor_id(struct imx858 *imx858,
 	ret |= imx858_read_reg(client, IMX858_REG_CHIP_ID_L,
 			       IMX858_REG_VALUE_08BIT, &reg_L);
 	id = ((reg_H << 8) & 0xff00) | (reg_L & 0xff);
-	if (!(reg_H == (CHIP_ID >> 8) || reg_L == (CHIP_ID & 0xff))) {
+
+	// both CHIP_ID and CHIP_ID2 are acceptable
+	if( id == (u16)CHIP_ID ||
+	    id == (u16)CHIP_ID2) {
+		dev_info(dev, "detected imx858 sensor id(%06x)\n", id);
+	}else {
 		dev_err(dev, "Unexpected sensor id(%06x), ret(%d)\n", id, ret);
 		return -ENODEV;
 	}

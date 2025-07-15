@@ -4,6 +4,7 @@
  *
  * Copyright (C) 2020 Rockchip Electronics Co., Ltd.
  */
+#include "linux/types.h"
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/interrupt.h>
@@ -1662,6 +1663,9 @@ static int rkcif_plat_hw_probe(struct platform_device *pdev)
 	cif_hw->is_in_reset = false;
 
 	cif_hw->iommu_en = is_iommu_enable(dev);
+	dev_info(dev, "IOMMU %sabled\n",
+		cif_hw->iommu_en ? "en" : "dis");
+		
 	ret = of_reserved_mem_device_init(dev);
 	if (ret) {
 		is_mem_reserved = false;

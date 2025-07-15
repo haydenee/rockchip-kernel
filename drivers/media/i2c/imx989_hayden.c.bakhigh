@@ -35,18 +35,17 @@
 #include <linux/rk-preisp.h>
 #include "otp_eeprom.h"
 
-#define DRIVER_VERSION			KERNEL_VERSION(0, 0x03, 0x00)
+#define DRIVER_VERSION			KERNEL_VERSION(0, 0x01, 0x00)
 
 #ifndef V4L2_CID_DIGITAL_GAIN
 #define V4L2_CID_DIGITAL_GAIN		V4L2_CID_GAIN
 #endif
 
-#define IMX989_MIPI_FREQ_1250M			1250000000
+#define IMX989_MIPI_FREQ_1250M			450000000
 
 #define IMX989_LANES			3
 
-// #define PIXEL_RATE_WITH_1250M_10BIT	((u64)IMX989_MIPI_FREQ_1250M * 2  * 3 / 10)
-#define PIXEL_RATE_WITH_1250M_10BIT	448000000
+#define PIXEL_RATE_WITH_1250M_10BIT	((u64)IMX989_MIPI_FREQ_1250M * 2  * 3 / 10)
 #define PIXEL_RATE_WITH_1250M_12BIT	((u64)IMX989_MIPI_FREQ_1250M * 2  * 3 / 12)
 
 #define IMX989_XVCLK_FREQ		19200000
@@ -195,7 +194,7 @@ struct imx989 {
 
 static const struct other_data imx989_spd = { //modified to 989, for pdaf 2048x768 L and R 
 	.width = 4096,
-	.height = 576,
+	.height = 768,
 	.bus_fmt = MEDIA_BUS_FMT_SPD_2X8,
 	.data_type = 0x30,
 	.data_bit = 10,
@@ -217,7 +216,7 @@ static const struct regval imx989_init_regs[] = { //modified to 989!
 	// Register version
 	{0x33F0, 0x07},
 	{0x33F1, 0x08},
-	// Signaling mode setting
+	// Signaling mode setting: cphy
 	{0x0111, 0x03},
 	// Global Setting
 	{0x316E, 0x00},
@@ -514,30 +513,30 @@ static const struct regval imx989_init_regs[] = { //modified to 989!
 	{0xF402, 0x01},
 	{0xF403, 0x01},
 	{0xF412, 0x00},
+
 	{REG_NULL, 0x00},
 };
 
 static const struct regval imx989_linear_10bit_4096x3072_30fps_pd_on[] = { //modified to 989!
-/* Reg_C: OBIN_4K_4096_2304_30FPS_PD_On the fly2 */
 	// MIPI output setting
 	{0x0112, 0x0A},
 	{0x0113, 0x0A},
-	{0x0114, 0x02},
+	{0x0114, 0x02},// 3-trio
 	// Line Length PCK Setting
 	{0x0342, 0x2B},
 	{0x0343, 0xA0},
 	{0x3152, 0x00},
 	// Frame Length Lines Setting
-	{0x0340, 0x25},
-	{0x0341, 0x98},
+	{0x0340, 0x2F},
+	{0x0341, 0x70},
 	// ROI Setting
 	{0x0344, 0x00},
 	{0x0345, 0x00},
-	{0x0346, 0x03},
+	{0x0346, 0x00},
 	{0x0347, 0x00},
 	{0x0348, 0x1F},
 	{0x0349, 0xFF},
-	{0x034A, 0x14},
+	{0x034A, 0x17},
 	{0x034B, 0xFF},
 	// Mode Setting
 	{0x0900, 0x01},
@@ -556,23 +555,23 @@ static const struct regval imx989_linear_10bit_4096x3072_30fps_pd_on[] = { //mod
 	{0x040B, 0x00},
 	{0x040C, 0x10},
 	{0x040D, 0x00},
-	{0x040E, 0x09},
+	{0x040E, 0x0C},
 	{0x040F, 0x00},
-	// Output Size Setting
+	// Output Size Setting 4096x3072
 	{0x034C, 0x10},
 	{0x034D, 0x00},
-	{0x034E, 0x09},
+	{0x034E, 0x0C},
 	{0x034F, 0x00},
 	// Clock Setting
 	{0x0301, 0x08},
 	{0x0303, 0x02},
 	{0x0305, 0x03},
-	{0x0306, 0x00},
-	{0x0307, 0xFC},
-	{0x030B, 0x02},
-	{0x030D, 0x04},
-	{0x030E, 0x02},
-	{0x030F, 0xE7},//743
+	{0x0306, 0x01},
+	{0x0307, 0x3E},
+	{0x030B, 0x04},
+	{0x030D, 0x02},
+	{0x030E, 0x01},
+	{0x030F, 0x77},
 	// Other Setting
 	{0x312D, 0x00},
 	{0x312E, 0x00},
@@ -637,8 +636,8 @@ static const struct regval imx989_linear_10bit_4096x3072_30fps_pd_on[] = { //mod
 	{0xD101, 0x04},
 	{0x7533, 0x00},
 	// Integration Setting
-	{0x0202, 0x25},
-	{0x0203, 0x68},
+	{0x0202, 0x2F},
+	{0x0203, 0x40},
 	{0x0224, 0x01},
 	{0x0225, 0xF4},
 	{0x3162, 0x01},
@@ -681,7 +680,7 @@ static const struct regval imx989_linear_10bit_4096x3072_30fps_pd_on[] = { //mod
 	{0xB875, 0xA0},
 	{0x7533, 0x00},
 	// PHASE PIX Setting
-	{0x3104, 0x00},//disable pd
+	{0x3104, 0x01},
 	{0x3131, 0x00},
 	{0x3132, 0x1C},
 	{0x3133, 0x80},
@@ -805,56 +804,31 @@ static const struct regval imx989_linear_10bit_4096x3072_30fps_pd_on[] = { //mod
 	// Data Identifier
 	{0x3087, 0x30},
 	// Global Timing MIPI (3567 Msps/trio)
-	{0x0808, 0x02},
+	{0x0808, 0x00},
 	// {0x084E, 0x00},
-	// {0x084F, 0x0F},
+	// {0x084F, 0x1F},
 	// {0x0850, 0x00},
-	// {0x0851, 0x0F},
+	// {0x0851, 0x19},
 	// {0x0852, 0x00},
-	// {0x0853, 0x19},
+	// {0x0853, 0x33},
 	// {0x0854, 0x00},
 	// {0x0855, 0x29},
 	// {0x0858, 0x00},
 	// {0x0859, 0x1F},
 
-	// 1783可用
-	{0x084E, 0x00},
-	{0x084F, 0x0F},
-	{0x0850, 0x00},
-	{0x0851, 0x0F},
-	{0x0852, 0x00},
-	{0x0853, 0x19},
-	{0x0854, 0x00},
-	{0x0855, 0x29},
-	{0x0858, 0x00},
-	{0x0859, 0x1F},
-
-	// {0x084E, 0x00},
-	// {0x084F, 0x0F},
-	// {0x0850, 0x00},
-	// {0x0851, 0x0F},
-	// {0x0852, 0x00},
-	// {0x0853, 0x19},
-	// {0x0854, 0x00},
-	// {0x0855, 0x29},
-	// {0x0858, 0x00},
-	// {0x0859, 0x1F},
-
-
-	{0x3968, 0x00},//turn off ebd
 	{REG_NULL, 0x00},
 };
 static const struct imx989_mode supported_modes[] = {
 	{
 		.width = 4096,
-		.height = 2304,
+		.height = 3072,
 		.max_fps = {
 			.numerator = 10000,
 			.denominator = 300000,
 		},
-		.exp_def = 8000,
-		.hts_def = 11168,//11168
-		.vts_def = 9624,//12144
+		.exp_def = 0x2000,
+		.hts_def = 0x2ba0,//11168
+		.vts_def = 0x2f70,//12144
 		.bus_fmt = MEDIA_BUS_FMT_SRGGB10_1X10,
 		.global_reg_list = imx989_init_regs,
 		.reg_list = imx989_linear_10bit_4096x3072_30fps_pd_on,
@@ -924,7 +898,6 @@ static int imx989_write_reg(struct i2c_client *client, u16 reg,
 	u8 buf[6];
 	u8 *val_p;
 	__be32 val_be;
-	u32 read_val;
 
 	if (len > 4)
 		return -EINVAL;
@@ -945,6 +918,7 @@ static int imx989_write_reg(struct i2c_client *client, u16 reg,
 
 	// readback
 	if (len == IMX989_REG_VALUE_08BIT) {
+		u32 read_val;
 		int ret = imx989_read_reg(client, reg, len, &read_val);
 		if (ret < 0)
 			return ret;
@@ -955,23 +929,12 @@ static int imx989_write_reg(struct i2c_client *client, u16 reg,
 				"expected 0x%02x, read 0x%02x\n",
 				reg, val & 0xff, read_val & 0xff);
 		}
-		else {
-			dev_info(&client->dev,
-				"%s: 0x%04x: 0x%02x\n",
-				__func__, reg, read_val & 0xff);
-		}
 	}else {
         dev_warn(&client->dev,
          "Unverified write to register 0x%04x: "
          "expected 0x%08x\n", reg, val);
     }
 
-	// we especially care about 0x0100
-	if (reg == 0x0100) {
-		dev_info(&client->dev,
-			 "IMX989_REG_CTRL_MODE register 0x%04x: 0x%08x 0x%08x\n",
-			 reg, val, read_val);
-	}
 
 	return 0;
 }
@@ -1087,18 +1050,15 @@ static int imx989_get_fmt(struct v4l2_subdev *sd,
 		return -ENOTTY;
 #endif
 	} else {
-		dev_info(&imx989->client->dev,
-				"%s: fmt->pad(%d)",
-				__func__, fmt->pad);
 		fmt->format.width = mode->width;
 		fmt->format.height = mode->height;
 		fmt->format.code = mode->bus_fmt;
 		fmt->format.field = V4L2_FIELD_NONE;
 		/* format info: width/height/data type/virctual channel */
-		if (fmt->pad < PAD_MAX && mode->hdr_mode != NO_HDR)
-			fmt->reserved[0] = mode->vc[fmt->pad];
-		else
-			fmt->reserved[0] = mode->vc[PAD0];
+		// if (fmt->pad < PAD_MAX && mode->hdr_mode != NO_HDR)
+		// 	fmt->reserved[0] = mode->vc[fmt->pad];
+		// else
+		// 	fmt->reserved[0] = mode->vc[PAD0];
 		if (fmt->pad == imx989->spd_id && mode->spd) {
 			fmt->format.width = mode->spd->width;
 			fmt->format.height = mode->spd->height;
@@ -1159,11 +1119,11 @@ static int imx989_enable_test_pattern(struct imx989 *imx989, u32 pattern)//ok fo
 		val = (pattern - 1) | IMX989_TEST_PATTERN_ENABLE;
 	else
 		val = IMX989_TEST_PATTERN_DISABLE;
-	return 0;
-	// return imx989_write_reg(imx989->client,
-	// 			IMX989_REG_TEST_PATTERN,
-	// 			IMX989_REG_VALUE_08BIT,
-	// 			val);
+
+	return imx989_write_reg(imx989->client,
+				IMX989_REG_TEST_PATTERN,
+				IMX989_REG_VALUE_08BIT,
+				val);
 }
 
 static int imx989_g_frame_interval(struct v4l2_subdev *sd,
@@ -1528,8 +1488,8 @@ static int imx989_set_flip(struct imx989 *imx989)//FIXME: Don't know 989's regis
 		val |= IMX989_FLIP_BIT_MASK;
 	else
 		val &= ~IMX989_FLIP_BIT_MASK;
-	// ret |= imx989_write_reg(imx989->client, IMX989_FLIP_MIRROR_REG,
-	// 			IMX989_REG_VALUE_08BIT, val);
+	ret |= imx989_write_reg(imx989->client, IMX989_FLIP_MIRROR_REG,
+				IMX989_REG_VALUE_08BIT, val);
 
 	return ret;
 }
@@ -1689,8 +1649,7 @@ static int __imx989_power_on(struct imx989 *imx989)//ok for all
 			return ret;
 		}
 		if (clk_get_rate(imx989->xvclk) != IMX989_XVCLK_FREQ)
-			dev_warn(dev, "xvclk mismatched, modes are based on 19.2MHz, actual: %lu\n",
-				 clk_get_rate(imx989->xvclk));
+			dev_warn(dev, "xvclk mismatched, modes are based on 19.2MHz\n");
 		ret = clk_prepare_enable(imx989->xvclk);
 		if (ret < 0) {
 			dev_err(dev, "Failed to enable xvclk\n");
@@ -1844,16 +1803,14 @@ static int imx989_set_gain_reg(struct imx989 *imx989, u32 a_gain) {
     int ret = 0;
     u32 gain_reg = 0;
     gain_reg = (16384 - (16384*16 / a_gain));
-    // ret = imx989_write_reg(imx989->client,
-    //     IMX989_REG_GAIN_H,
-    //     IMX989_REG_VALUE_08BIT,
-    //     IMX989_FETCH_AGAIN_H(gain_reg));
-    // ret |= imx989_write_reg(imx989->client,
-    //     IMX989_REG_GAIN_L,
-    //     IMX989_REG_VALUE_08BIT,
-    //     IMX989_FETCH_AGAIN_L(gain_reg));
-	dev_info(&imx989->client->dev, "set gain 0x%x, reg:0x%x\n",
-		a_gain, gain_reg);
+    ret = imx989_write_reg(imx989->client,
+        IMX989_REG_GAIN_H,
+        IMX989_REG_VALUE_08BIT,
+        IMX989_FETCH_AGAIN_H(gain_reg));
+    ret |= imx989_write_reg(imx989->client,
+        IMX989_REG_GAIN_L,
+        IMX989_REG_VALUE_08BIT,
+        IMX989_FETCH_AGAIN_L(gain_reg));
     return ret;
 }
 
@@ -1882,34 +1839,34 @@ static int imx989_set_ctrl(struct v4l2_ctrl *ctrl)//FIXME: check 989's exposure 
 	switch (ctrl->id) {
 	case V4L2_CID_EXPOSURE:
 		/* 4 least significant bits of expsoure are fractional part */
-		// ret = imx989_write_reg(imx989->client,
-		// 		       IMX989_REG_EXPOSURE_H,
-		// 		       IMX989_REG_VALUE_08BIT,
-		// 		       IMX989_FETCH_EXP_H(ctrl->val));
-		// ret |= imx989_write_reg(imx989->client,
-		// 			IMX989_REG_EXPOSURE_L,
-		// 			IMX989_REG_VALUE_08BIT,
-		// 			IMX989_FETCH_EXP_L(ctrl->val));
-		dev_info(&client->dev, "set exposure 0x%x\n",
+		ret = imx989_write_reg(imx989->client,
+				       IMX989_REG_EXPOSURE_H,
+				       IMX989_REG_VALUE_08BIT,
+				       IMX989_FETCH_EXP_H(ctrl->val));
+		ret |= imx989_write_reg(imx989->client,
+					IMX989_REG_EXPOSURE_L,
+					IMX989_REG_VALUE_08BIT,
+					IMX989_FETCH_EXP_L(ctrl->val));
+		dev_dbg(&client->dev, "set exposure 0x%x\n",
 			ctrl->val);
 		break;
 	case V4L2_CID_ANALOGUE_GAIN:
 		ret = imx989_set_gain_reg(imx989, ctrl->val);
 		break;
 	case V4L2_CID_VBLANK:
-		// ret = imx989_write_reg(imx989->client,
-		// 		       IMX989_REG_VTS_H,
-		// 		       IMX989_REG_VALUE_08BIT,
-		// 		       (ctrl->val + imx989->cur_mode->height)
-		// 		       >> 8);
-		// ret |= imx989_write_reg(imx989->client,
-		// 			IMX989_REG_VTS_L,
-		// 			IMX989_REG_VALUE_08BIT,
-		// 			(ctrl->val + imx989->cur_mode->height)
-		// 			& 0xff);
+		ret = imx989_write_reg(imx989->client,
+				       IMX989_REG_VTS_H,
+				       IMX989_REG_VALUE_08BIT,
+				       (ctrl->val + imx989->cur_mode->height)
+				       >> 8);
+		ret |= imx989_write_reg(imx989->client,
+					IMX989_REG_VTS_L,
+					IMX989_REG_VALUE_08BIT,
+					(ctrl->val + imx989->cur_mode->height)
+					& 0xff);
 		imx989->cur_vts = ctrl->val + imx989->cur_mode->height;
 
-		dev_info(&client->dev, "set vblank 0x%x\n",
+		dev_dbg(&client->dev, "set vblank 0x%x\n",
 			ctrl->val);
 		break;
 	case V4L2_CID_HFLIP:
@@ -1917,7 +1874,7 @@ static int imx989_set_ctrl(struct v4l2_ctrl *ctrl)//FIXME: check 989's exposure 
 			imx989->flip |= IMX989_MIRROR_BIT_MASK;
 		else
 			imx989->flip &= ~IMX989_MIRROR_BIT_MASK;
-		dev_info(&client->dev, "set hflip 0x%x\n",
+		dev_dbg(&client->dev, "set hflip 0x%x\n",
 			ctrl->val);
 		break;
 	case V4L2_CID_VFLIP:
@@ -1925,11 +1882,11 @@ static int imx989_set_ctrl(struct v4l2_ctrl *ctrl)//FIXME: check 989's exposure 
 			imx989->flip |= IMX989_FLIP_BIT_MASK;
 		else
 			imx989->flip &= ~IMX989_FLIP_BIT_MASK;
-		dev_info(&client->dev, "set vflip 0x%x\n",
+		dev_dbg(&client->dev, "set vflip 0x%x\n",
 			ctrl->val);
 		break;
 	case V4L2_CID_TEST_PATTERN:
-		dev_info(&client->dev, "set testpattern 0x%x\n",
+		dev_dbg(&client->dev, "set testpattern 0x%x\n",
 			ctrl->val);
 		ret = imx989_enable_test_pattern(imx989, ctrl->val);
 		break;
