@@ -2333,7 +2333,7 @@ static irqreturn_t rkcif_irq_handler(int irq, struct rkcif_device *cif_dev)
 	} else {
 		rkcif_irq_oneframe(cif_dev);
 	}
-	v4l2_info(&cif_dev->v4l2_dev, "rkcif_irq_handler: IRQ %d\n", irq);
+	// v4l2_info(&cif_dev->v4l2_dev, "rkcif_irq_handler: IRQ %d\n", irq);
 	return IRQ_HANDLED;
 }
 
