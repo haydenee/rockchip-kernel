@@ -175,6 +175,7 @@ struct csi2_dev {
 	struct rkcif_csi_info	csi_info;
 	const char		*dev_name;
 	int			sw_dbg;
+	struct dentry		*debug_dir;
 };
 
 struct csi2_hw {

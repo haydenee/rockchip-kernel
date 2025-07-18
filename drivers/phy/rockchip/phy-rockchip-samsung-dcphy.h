@@ -76,6 +76,14 @@ struct samsung_mipi_dcphy {
 	int (*stream_on)(struct csi2_dphy *dphy, struct v4l2_subdev *sd);
 	int (*stream_off)(struct csi2_dphy *dphy, struct v4l2_subdev *sd);
 	struct resource *res;
+
+	struct dentry *debugfs_root;
+    u32 ths_settle_override[3]; /* Override values for lanes 0-2 */
+    bool ths_settle_override_enable;
+	char debugfs_name[32]; /* Unique name for this instance */
+
+	struct dentry *debugfs_reg_dir;
+    u32 debug_reg_addr;  // 用于存储要操作的寄存器地址
 };
 
 #endif

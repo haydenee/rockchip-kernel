@@ -7,6 +7,7 @@
  */
 
 //#define DEBUG
+#include "linux/debugfs.h"
 #include "media/v4l2-mediabus.h"
 #include <linux/clk.h>
 #include <linux/device.h>
@@ -41,7 +42,8 @@
 #define V4L2_CID_DIGITAL_GAIN		V4L2_CID_GAIN
 #endif
 
-#define IMX989_MIPI_FREQ_1250M			300000000
+// #define IMX989_MIPI_FREQ_1250M			300000000
+#define IMX989_MIPI_FREQ_1250M			1000000000
 
 #define IMX989_LANES			3
 
@@ -189,6 +191,11 @@ struct imx989 {
 	u32			spd_id;
 	u32			ebd_id;
 	struct v4l2_fwnode_endpoint bus_cfg;
+
+	struct dentry *debugfs_dir;
+    struct dentry *reg_read_file;
+    struct dentry *reg_write_file;
+    u16 debug_reg_addr;  // 用于存储要操作的寄存器地址
 };
 
 #define to_imx989(sd) container_of(sd, struct imx989, subdev)
@@ -570,9 +577,9 @@ static const struct regval imx989_linear_10bit_4096x3072_30fps_pd_on[] = { //mod
 	{0x0306, 0x00},
 	{0x0307, 0xFC},
 	{0x030B, 0x02},
-	{0x030D, 0x04},
+	{0x030D, 0x03},
 	{0x030E, 0x02},
-	{0x030F, 0xE7},//743
+	{0x030F, 0x71},//625
 	// Other Setting
 	{0x312D, 0x00},
 	{0x312E, 0x00},
@@ -842,7 +849,7 @@ static const struct regval imx989_linear_10bit_4096x3072_30fps_pd_on[] = { //mod
 
 	// {0x3300,0x06},//3dB
 	// {0x3301,0x01},//TXEQ ENable
-
+	{0x3104, 0x00},//disable pd
 	{0x3968, 0x00},//turn off ebd
 	{0x0601, 0x02},//test pattern
 
@@ -2114,7 +2121,12 @@ static int imx989_runtime_resume(struct device *dev)//ok for all
 	struct i2c_client *client = to_i2c_client(dev);
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct imx989 *imx989 = to_imx989(sd);
-
+	dev_info(dev, "%s: %s\n", __func__,
+			imx989->power_on ? "already powered on" : "powering on");
+	if (imx989->power_on) {
+		dev_err(dev, "imx989 is already powered on\n");
+		return 0;
+	}
 	return __imx989_power_on(imx989);
 }
 
@@ -2123,8 +2135,9 @@ static int imx989_runtime_suspend(struct device *dev)//ok for all
 	struct i2c_client *client = to_i2c_client(dev);
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct imx989 *imx989 = to_imx989(sd);
-
-	__imx989_power_off(imx989);
+	dev_info(dev, "%s: %s\n", __func__,
+			imx989->power_on ? "powering off" : "already powered off");
+	// __imx989_power_off(imx989);
 
 	return 0;
 }
@@ -2439,6 +2452,342 @@ static int imx989_configure_regulators(struct imx989 *imx989)//ok for all
 				       imx989->supplies);
 }
 
+// 寄存器地址设置接口
+static ssize_t imx989_debugfs_reg_addr_write(struct file *file,
+                                             const char __user *buf,
+                                             size_t count, loff_t *ppos)
+{
+    struct imx989 *imx989 = file->private_data;
+    char kbuf[16];
+    unsigned int addr;
+    int ret;
+
+    if (count >= sizeof(kbuf))
+        return -EINVAL;
+
+    if (copy_from_user(kbuf, buf, count))
+        return -EFAULT;
+
+    kbuf[count] = '\0';
+    
+    ret = kstrtouint(kbuf, 0, &addr);
+    if (ret)
+        return ret;
+
+    if (addr > 0xFFFF) {
+        dev_err(&imx989->client->dev, "Invalid register address: 0x%x\n", addr);
+        return -EINVAL;
+    }
+
+    imx989->debug_reg_addr = (u16)addr;
+    dev_info(&imx989->client->dev, "Set debug register address to 0x%04x\n", 
+             imx989->debug_reg_addr);
+
+    return count;
+}
+
+static ssize_t imx989_debugfs_reg_addr_read(struct file *file,
+                                            char __user *buf,
+                                            size_t count, loff_t *ppos)
+{
+    struct imx989 *imx989 = file->private_data;
+    char kbuf[32];
+    int len;
+
+    len = snprintf(kbuf, sizeof(kbuf), "0x%04x\n", imx989->debug_reg_addr);
+    
+    return simple_read_from_buffer(buf, count, ppos, kbuf, len);
+}
+
+// 寄存器读取接口
+static ssize_t imx989_debugfs_reg_read(struct file *file,
+                                       char __user *buf,
+                                       size_t count, loff_t *ppos)
+{
+    struct imx989 *imx989 = file->private_data;
+    char kbuf[64];
+    u32 val;
+    int ret, len;
+
+    if (!pm_runtime_get_if_in_use(&imx989->client->dev)) {
+        dev_err(&imx989->client->dev, "Device is not powered on\n");
+        return -ENODEV;
+    }
+
+    ret = imx989_read_reg(imx989->client, imx989->debug_reg_addr,
+                         IMX989_REG_VALUE_08BIT, &val);
+    
+    pm_runtime_put(&imx989->client->dev);
+    
+    if (ret) {
+        dev_err(&imx989->client->dev, "Failed to read register 0x%04x: %d\n",
+                imx989->debug_reg_addr, ret);
+        return ret;
+    }
+
+    len = snprintf(kbuf, sizeof(kbuf), "reg[0x%04x] = 0x%02x (%d)\n",
+                   imx989->debug_reg_addr, val & 0xFF, val & 0xFF);
+
+    dev_info(&imx989->client->dev, "Read reg[0x%04x] = 0x%02x\n",
+             imx989->debug_reg_addr, val & 0xFF);
+
+    return simple_read_from_buffer(buf, count, ppos, kbuf, len);
+}
+
+// 寄存器写入接口
+static ssize_t imx989_debugfs_reg_write(struct file *file,
+                                        const char __user *buf,
+                                        size_t count, loff_t *ppos)
+{
+    struct imx989 *imx989 = file->private_data;
+    char kbuf[16];
+    unsigned int val;
+    int ret;
+
+    if (count >= sizeof(kbuf))
+        return -EINVAL;
+
+    if (copy_from_user(kbuf, buf, count))
+        return -EFAULT;
+
+    kbuf[count] = '\0';
+    
+    ret = kstrtouint(kbuf, 0, &val);
+    if (ret)
+        return ret;
+
+    if (val > 0xFF) {
+        dev_err(&imx989->client->dev, "Invalid register value: 0x%x\n", val);
+        return -EINVAL;
+    }
+
+    if (!pm_runtime_get_if_in_use(&imx989->client->dev)) {
+        dev_err(&imx989->client->dev, "Device is not powered on\n");
+        return -ENODEV;
+    }
+
+    ret = imx989_write_reg(imx989->client, imx989->debug_reg_addr,
+                          IMX989_REG_VALUE_08BIT, val);
+    
+    pm_runtime_put(&imx989->client->dev);
+    
+    if (ret) {
+        dev_err(&imx989->client->dev, "Failed to write register 0x%04x: %d\n",
+                imx989->debug_reg_addr, ret);
+        return ret;
+    }
+
+    dev_info(&imx989->client->dev, "Write reg[0x%04x] = 0x%02x\n",
+             imx989->debug_reg_addr, val & 0xFF);
+
+    return count;
+}
+// 批量寄存器操作接口（修正版）
+static ssize_t imx989_debugfs_reg_batch_write(struct file *file,
+                                              const char __user *buf,
+                                              size_t count, loff_t *ppos)
+{
+    struct imx989 *imx989 = file->private_data;
+    char *kbuf, *ptr, *line_end, *token, *eq;
+    unsigned int addr, val;
+    int ret = 0, total_written = 0;
+
+    kbuf = kzalloc(count + 1, GFP_KERNEL);
+    if (!kbuf)
+        return -ENOMEM;
+
+    if (copy_from_user(kbuf, buf, count)) {
+        ret = -EFAULT;
+        goto out;
+    }
+    kbuf[count] = '\0';
+
+    if (!pm_runtime_get_if_in_use(&imx989->client->dev)) {
+        dev_err(&imx989->client->dev, "Device is not powered on\n");
+        ret = -ENODEV;
+        goto out;
+    }
+
+    ptr = kbuf;
+    
+    // 处理每一行
+    while (ptr && *ptr && ret >= 0) {
+        // 找到行结束符或字符串结束
+        line_end = strchr(ptr, '\n');
+        if (line_end)
+            *line_end = '\0';
+        
+        // 跳过空行和空白字符
+        while (*ptr && isspace(*ptr))
+            ptr++;
+        
+        if (!*ptr) {
+            if (line_end)
+                ptr = line_end + 1;
+            else
+                break;
+            continue;
+        }
+        
+        // 处理当前行中的每个 addr=val 对（用逗号分隔）
+        while (ptr && *ptr && ret >= 0) {
+            // 跳过空白字符
+            while (*ptr && isspace(*ptr))
+                ptr++;
+            
+            if (!*ptr)
+                break;
+                
+            // 找到下一个逗号或行结束
+            token = ptr;
+            while (*ptr && *ptr != ',' && *ptr != '\n' && *ptr != '\0')
+                ptr++;
+            
+            // 如果找到逗号，则用 null 终止当前 token
+            if (*ptr == ',') {
+                *ptr = '\0';
+                ptr++;
+            } else if (*ptr == '\n' || *ptr == '\0') {
+                if (*ptr == '\n')
+                    *ptr = '\0';
+                ptr = NULL; // 表示这是行的最后一个 token
+            }
+            
+            // 跳过 token 开头的空白字符
+            while (*token && isspace(*token))
+                token++;
+            
+            if (!*token)
+                continue;
+            
+            // 查找等号
+            eq = strchr(token, '=');
+            if (!eq) {
+                dev_err(&imx989->client->dev, "Invalid format: %s (missing '=')\n", token);
+                ret = -EINVAL;
+                break;
+            }
+            
+            *eq = '\0';
+            eq++;
+            
+            // 解析地址和值
+            if (kstrtouint(token, 0, &addr) || kstrtouint(eq, 0, &val)) {
+                dev_err(&imx989->client->dev, "Invalid number format: addr=%s, val=%s\n", token, eq);
+                ret = -EINVAL;
+                break;
+            }
+            
+            if (addr > 0xFFFF || val > 0xFF) {
+                dev_err(&imx989->client->dev, "Invalid range: addr=0x%x, val=0x%x\n", addr, val);
+                ret = -EINVAL;
+                break;
+            }
+            
+            // 写入寄存器
+            ret = imx989_write_reg(imx989->client, (u16)addr,
+                                  IMX989_REG_VALUE_08BIT, val);
+            if (ret < 0) {
+                dev_err(&imx989->client->dev, "Failed to write reg[0x%04x]=0x%02x: %d\n",
+                        addr, val, ret);
+                break;
+            }
+                
+            total_written++;
+            dev_info(&imx989->client->dev, "Batch write reg[0x%04x] = 0x%02x\n",
+                     addr, val);
+        }
+        
+        // 移动到下一行
+        if (line_end && ptr == NULL)
+            ptr = line_end + 1;
+        else if (ptr == NULL)
+            break;
+    }
+
+    pm_runtime_put(&imx989->client->dev);
+
+    if (ret >= 0) {
+        dev_info(&imx989->client->dev, "Batch write completed: %d registers\n",
+                 total_written);
+        ret = count;
+    }
+
+out:
+    kfree(kbuf);
+    return ret;
+}
+
+static const struct file_operations imx989_debugfs_reg_addr_fops = {
+    .open = simple_open,
+    .read = imx989_debugfs_reg_addr_read,
+    .write = imx989_debugfs_reg_addr_write,
+    .llseek = default_llseek,
+};
+
+static const struct file_operations imx989_debugfs_reg_read_fops = {
+    .open = simple_open,
+    .read = imx989_debugfs_reg_read,
+    .llseek = default_llseek,
+};
+
+static const struct file_operations imx989_debugfs_reg_write_fops = {
+    .open = simple_open,
+    .write = imx989_debugfs_reg_write,
+    .llseek = default_llseek,
+};
+
+static const struct file_operations imx989_debugfs_reg_batch_fops = {
+    .open = simple_open,
+    .write = imx989_debugfs_reg_batch_write,
+    .llseek = default_llseek,
+};
+
+static int imx989_debugfs_init(struct imx989 *imx989)
+{
+    struct device *dev = &imx989->client->dev;
+    char dirname[32];
+
+    // 创建以设备名称命名的目录
+    snprintf(dirname, sizeof(dirname), "imx989-%s", dev_name(dev));
+    
+    imx989->debugfs_dir = debugfs_create_dir(dirname, NULL);
+    if (IS_ERR_OR_NULL(imx989->debugfs_dir)) {
+        dev_warn(dev, "Failed to create debugfs directory\n");
+        return -ENODEV;
+    }
+
+    // 创建寄存器地址设置接口
+    debugfs_create_file("reg_addr", 0644, imx989->debugfs_dir, imx989,
+                       &imx989_debugfs_reg_addr_fops);
+
+    // 创建寄存器读取接口  
+    debugfs_create_file("reg_read", 0444, imx989->debugfs_dir, imx989,
+                       &imx989_debugfs_reg_read_fops);
+
+    // 创建寄存器写入接口
+    debugfs_create_file("reg_write", 0200, imx989->debugfs_dir, imx989,
+                       &imx989_debugfs_reg_write_fops);
+
+    // 创建批量操作接口
+    debugfs_create_file("reg_batch", 0200, imx989->debugfs_dir, imx989,
+                       &imx989_debugfs_reg_batch_fops);
+
+    // 创建一些只读状态文件
+    debugfs_create_bool("streaming", 0444, imx989->debugfs_dir, &imx989->streaming);
+    debugfs_create_bool("power_on", 0444, imx989->debugfs_dir, &imx989->power_on);
+    debugfs_create_u32("cur_vts", 0444, imx989->debugfs_dir, &imx989->cur_vts);
+
+    dev_info(dev, "debugfs initialized at /sys/kernel/debug/%s\n", dirname);
+    return 0;
+}
+
+static void imx989_debugfs_cleanup(struct imx989 *imx989)
+{
+    debugfs_remove_recursive(imx989->debugfs_dir);
+    imx989->debugfs_dir = NULL;
+}
+
 static int imx989_probe(struct i2c_client *client,
 			const struct i2c_device_id *id)
 {
@@ -2633,7 +2982,11 @@ continue_probe:
 
 	pm_runtime_set_active(dev);
 	pm_runtime_enable(dev);
-	pm_runtime_idle(dev);
+	// pm_runtime_idle(dev);
+	pm_runtime_get_sync(dev);
+	pm_runtime_get_sync(dev);
+	pm_runtime_put_noidle(dev);
+	ret = imx989_debugfs_init(imx989);
 
 	return 0;
 
@@ -2655,7 +3008,7 @@ static void imx989_remove(struct i2c_client *client)//ok for all
 {
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct imx989 *imx989 = to_imx989(sd);
-
+	imx989_debugfs_cleanup(imx989);
 	v4l2_async_unregister_subdev(sd);
 #if defined(CONFIG_MEDIA_CONTROLLER)
 	media_entity_cleanup(&sd->entity);

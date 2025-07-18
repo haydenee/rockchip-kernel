@@ -7,6 +7,7 @@
  */
 
 //#define DEBUG
+#include "linux/debugfs.h"
 #include "media/v4l2-mediabus.h"
 #include <linux/clk.h>
 #include <linux/device.h>
@@ -34,8 +35,9 @@
 #include <linux/mfd/syscon.h>
 #include <linux/rk-preisp.h>
 #include "otp_eeprom.h"
+#include "linux/string.h"
 
-#define DRIVER_VERSION			KERNEL_VERSION(0, 0x01, 0x00)
+#define DRIVER_VERSION			KERNEL_VERSION(0, 0x02, 0x00)
 
 #ifndef V4L2_CID_DIGITAL_GAIN
 #define V4L2_CID_DIGITAL_GAIN		V4L2_CID_GAIN
@@ -44,7 +46,7 @@
 #define IMX858_MIPI_FREQ_356M			356000000
 #define IMX858_MIPI_FREQ_384M			384000000
 #define IMX858_MIPI_FREQ_750M			750000000
-#define IMX858_MIPI_FREQ_1250M			1250000000
+#define IMX858_MIPI_FREQ_1250M			1080000000
 
 #define IMX858_LANES			3
 
@@ -192,6 +194,11 @@ struct imx858 {
 	u32			spd_id;
 	u32			ebd_id;
 	struct v4l2_fwnode_endpoint bus_cfg;
+
+	struct dentry *debugfs_dir;
+    struct dentry *reg_read_file;
+    struct dentry *reg_write_file;
+    u16 debug_reg_addr;  // 用于存储要操作的寄存器地址
 };
 
 #define to_imx858(sd) container_of(sd, struct imx858, subdev)
@@ -575,7 +582,7 @@ static const struct regval imx858_init_regs[] = { //modified to 858!
 	{REG_NULL, 0x00},
 };
 
-static const struct regval imx858_linear_10bit_4096x3072_30fps_pd_on[] = { //modified to 858!
+static const struct regval imx858_linear_10bit_4096x2304_30fps_pd_on[] = { //modified to 858!
 // MIPI output setting
 	{0x0112, 0x0A},
 	{0x0113, 0x0A},
@@ -592,12 +599,12 @@ static const struct regval imx858_linear_10bit_4096x3072_30fps_pd_on[] = { //mod
 // ROI Setting
 	{0x0344, 0x00},
 	{0x0345, 0x00},
-	{0x0346, 0x01},
-	{0x0347, 0x20},
+	{0x0346, 0x03},
+	{0x0347, 0x00},
 	{0x0348, 0x1F},
 	{0x0349, 0xFF},
-	{0x034A, 0x16},
-	{0x034B, 0xDF},
+	{0x034A, 0x14},
+	{0x034B, 0xFF},
 // Mode Setting
 	{0x0900, 0x01},
 	{0x0901, 0x22},
@@ -611,29 +618,29 @@ static const struct regval imx858_linear_10bit_4096x3072_30fps_pd_on[] = { //mod
 	{0x31C1, 0x41},
 	{0x3205, 0x00},
 // Digital Crop & Scaling
-    {0x0408,0x00},
-    {0x0409,0x00},
-    {0x040A,0x00},
-    {0x040B,0x00},
-    {0x040C,0x10},
-    {0x040D,0x00},
-    {0x040E,0x0C},
-    {0x040F,0x00},
+	{0x0408, 0x00},
+	{0x0409, 0x00},
+	{0x040A, 0x00},
+	{0x040B, 0x00},
+	{0x040C, 0x10},
+	{0x040D, 0x00},
+	{0x040E, 0x09},
+	{0x040F, 0x00},
 // Output Size Setting
-    {0x034C,0x10},
-    {0x034D,0x00},
-    {0x034E,0x0C},
-    {0x034F,0x00},
+	{0x034C, 0x10},
+	{0x034D, 0x00},
+	{0x034E, 0x09},
+	{0x034F, 0x00},
 // Clock Setting
 	{0x0301, 0x05},
 	{0x0303, 0x02},
 	{0x0305, 0x02},
 	{0x0306, 0x00},
 	{0x0307, 0xB7},
-	{0x030B, 0x02},
-	{0x030D, 0x0C},
-	{0x030E, 0x05},
-	{0x030F, 0xCF},
+	{0x030B, 0x01},
+	{0x030D, 0x02},
+	{0x030E, 0x00},
+	{0x030F, 0xE1},
 // Other Setting
 	{0x3104, 0x01},
 	{0x324C, 0x01},
@@ -673,9 +680,7 @@ static const struct regval imx858_linear_10bit_4096x3072_30fps_pd_on[] = { //mod
 	{0x3B07, 0x00},
 	{0x3B0A, 0x00},
 	{0x3B0B, 0x00},
-	{0x9674, 0x07},
-	{0x9675, 0x4B},
-// Integration Setting/
+// Integration Setting
 	{0x0202, 0x03},
 	{0x0203, 0xE8},
 // Gain Setting
@@ -683,46 +688,33 @@ static const struct regval imx858_linear_10bit_4096x3072_30fps_pd_on[] = { //mod
 	{0x0205, 0x34},
 	{0x020E, 0x01},
 	{0x020F, 0x00},
-// DOL Setting,
-	{0x3190, 0x00},
-// Integration setting2
-	{0x0224, 0x01},
-	{0x0225, 0xF4},
-// Gain Setting,
-	{0x0216, 0x00},
-	{0x0217, 0x00},
-	{0x0218, 0x01},
-	{0x0219, 0x00},
 // PHASE PIX VCID Setting
 	{0x30A4, 0x00},
 	{0x30A6, 0x00},
-	{0x30C6, 0x01},
-	{0x30C8, 0x01},
 	{0x30F2, 0x01},
 	{0x30F3, 0x01},
 // PHASE PIX data type Setting
 	{0x30A5, 0x30},
 	{0x30A7, 0x30},
-	{0x30C7, 0x30},
-	{0x30C9, 0x30},
 // MIPI Global Timing Setting
 	{0x084E, 0x00},
-	{0x084F, 0x0D},
+	{0x084F, 0x19},
 	{0x0850, 0x00},
-	{0x0851, 0x0B},
+	{0x0851, 0x15},
 	{0x0852, 0x00},
-	{0x0853, 0x17},
+	{0x0853, 0x29},
 	{0x0854, 0x00},
 	{0x0855, 0x29},
 	{0x0858, 0x00},
 	{0x0859, 0x1F},
-
+	
+	{0x0601, 0x02},//test pattern
 	{REG_NULL, 0x00},
 };
 static const struct imx858_mode supported_modes[] = {
 	{
 		.width = 4096,
-		.height = 3072,
+		.height = 2304,
 		.max_fps = {
 			.numerator = 10000,
 			.denominator = 300000,
@@ -732,19 +724,19 @@ static const struct imx858_mode supported_modes[] = {
 		.vts_def = 0x0f3e,//3902
 		.bus_fmt = MEDIA_BUS_FMT_SRGGB10_1X10,
 		.global_reg_list = imx858_init_regs,
-		.reg_list = imx858_linear_10bit_4096x3072_30fps_pd_on,
-		.spd = &imx858_spd,
-		.ebd = &imx858_ebd,
+		.reg_list = imx858_linear_10bit_4096x2304_30fps_pd_on,
+		// .spd = &imx858_spd,
+		// .ebd = &imx858_ebd,
 		.hdr_mode = NO_HDR,
-		.mipi_freq_idx = 3,
+		.mipi_freq_idx = 0,
 		.vc[PAD0] = 0,
 	},
 };
 
 static const s64 link_freq_items[] = {
-	IMX858_MIPI_FREQ_356M,
-	IMX858_MIPI_FREQ_384M,
-	IMX858_MIPI_FREQ_750M,
+	// IMX858_MIPI_FREQ_356M,
+	// IMX858_MIPI_FREQ_384M,
+	// IMX858_MIPI_FREQ_750M,
 	IMX858_MIPI_FREQ_1250M,
 };
 static const char * const imx858_test_pattern_menu[] = {
@@ -763,7 +755,7 @@ static int imx858_read_reg(struct i2c_client *client, u16 reg, unsigned int len,
 	u8 *data_be_p;
 	__be32 data_be = 0;
 	__be16 reg_addr_be = cpu_to_be16(reg);
-	int ret, i;
+	int ret, i; 
 
 	if (len > 4 || !len)
 		return -EINVAL;
@@ -874,12 +866,12 @@ static int imx858_write_reg(struct i2c_client *client, u16 reg,
          "expected 0x%08x\n", reg, val);
     }
 
-	// // we especially care about 0x0100
-	// if (reg == 0x0100) {
-	// 	dev_info(&client->dev,
-	// 		 "IMX858_REG_CTRL_MODE register 0x%04x: 0x%08x 0x%08x\n",
-	// 		 reg, val, read_val);
-	// }
+	// we especially care about 0x0100
+	if (reg == 0x0100) {
+		dev_info(&client->dev,
+			 "IMX858_REG_CTRL_MODE register 0x%04x: 0x%08x 0x%08x\n",
+			 reg, val, read_val);
+	}
 
 	return 0;
 }
@@ -1065,10 +1057,11 @@ static int imx858_enable_test_pattern(struct imx858 *imx858, u32 pattern)//ok fo
 	else
 		val = IMX858_TEST_PATTERN_DISABLE;
 
-	return imx858_write_reg(imx858->client,
-				IMX858_REG_TEST_PATTERN,
-				IMX858_REG_VALUE_08BIT,
-				val);
+	// return imx858_write_reg(imx858->client,
+	// 			IMX858_REG_TEST_PATTERN,
+	// 			IMX858_REG_VALUE_08BIT,
+	// 			val);
+	return 0;
 }
 
 static int imx858_g_frame_interval(struct v4l2_subdev *sd,
@@ -1429,8 +1422,8 @@ static int imx858_set_flip(struct imx858 *imx858)//FIXME: Don't know 989's regis
 		val |= IMX858_FLIP_BIT_MASK;
 	else
 		val &= ~IMX858_FLIP_BIT_MASK;
-	ret |= imx858_write_reg(imx858->client, IMX858_FLIP_MIRROR_REG,
-				IMX858_REG_VALUE_08BIT, val);
+	// ret |= imx858_write_reg(imx858->client, IMX858_FLIP_MIRROR_REG,
+	// 			IMX858_REG_VALUE_08BIT, val);
 
 	return ret;
 }
@@ -1638,7 +1631,12 @@ static int imx858_runtime_resume(struct device *dev)//ok for all
 	struct i2c_client *client = to_i2c_client(dev);
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct imx858 *imx858 = to_imx858(sd);
-
+	dev_info(dev, "%s: %s\n", __func__,
+			imx858->power_on ? "already powered on" : "powering on");
+	if (imx858->power_on) {
+		dev_err(dev, "imx858 is already powered on\n");
+		return 0;
+	}
 	return __imx858_power_on(imx858);
 }
 
@@ -1647,8 +1645,9 @@ static int imx858_runtime_suspend(struct device *dev)//ok for all
 	struct i2c_client *client = to_i2c_client(dev);
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct imx858 *imx858 = to_imx858(sd);
-
-	__imx858_power_off(imx858);
+	dev_info(dev, "%s: %s\n", __func__,
+			imx858->power_on ? "powering off" : "already powered off");
+	// __imx858_power_off(imx858);
 
 	return 0;
 }
@@ -1735,14 +1734,14 @@ static int imx858_set_gain_reg(struct imx858 *imx858, u32 a_gain) {
     int ret = 0;
     u32 gain_reg = 0;
     gain_reg = (16384 - (16384*16 / a_gain));
-    ret = imx858_write_reg(imx858->client,
-        IMX858_REG_GAIN_H,
-        IMX858_REG_VALUE_08BIT,
-        IMX858_FETCH_AGAIN_H(gain_reg));
-    ret |= imx858_write_reg(imx858->client,
-        IMX858_REG_GAIN_L,
-        IMX858_REG_VALUE_08BIT,
-        IMX858_FETCH_AGAIN_L(gain_reg));
+    // ret = imx858_write_reg(imx858->client,
+    //     IMX858_REG_GAIN_H,
+    //     IMX858_REG_VALUE_08BIT,
+    //     IMX858_FETCH_AGAIN_H(gain_reg));
+    // ret |= imx858_write_reg(imx858->client,
+    //     IMX858_REG_GAIN_L,
+    //     IMX858_REG_VALUE_08BIT,
+    //     IMX858_FETCH_AGAIN_L(gain_reg));
     return ret;
 }
 
@@ -1771,14 +1770,14 @@ static int imx858_set_ctrl(struct v4l2_ctrl *ctrl)//FIXME: check 989's exposure 
 	switch (ctrl->id) {
 	case V4L2_CID_EXPOSURE:
 		/* 4 least significant bits of expsoure are fractional part */
-		ret = imx858_write_reg(imx858->client,
-				       IMX858_REG_EXPOSURE_H,
-				       IMX858_REG_VALUE_08BIT,
-				       IMX858_FETCH_EXP_H(ctrl->val));
-		ret |= imx858_write_reg(imx858->client,
-					IMX858_REG_EXPOSURE_L,
-					IMX858_REG_VALUE_08BIT,
-					IMX858_FETCH_EXP_L(ctrl->val));
+		// ret = imx858_write_reg(imx858->client,
+		// 		       IMX858_REG_EXPOSURE_H,
+		// 		       IMX858_REG_VALUE_08BIT,
+		// 		       IMX858_FETCH_EXP_H(ctrl->val));
+		// ret |= imx858_write_reg(imx858->client,
+		// 			IMX858_REG_EXPOSURE_L,
+		// 			IMX858_REG_VALUE_08BIT,
+		// 			IMX858_FETCH_EXP_L(ctrl->val));
 		dev_dbg(&client->dev, "set exposure 0x%x\n",
 			ctrl->val);
 		break;
@@ -1786,16 +1785,16 @@ static int imx858_set_ctrl(struct v4l2_ctrl *ctrl)//FIXME: check 989's exposure 
 		ret = imx858_set_gain_reg(imx858, ctrl->val);
 		break;
 	case V4L2_CID_VBLANK:
-		ret = imx858_write_reg(imx858->client,
-				       IMX858_REG_VTS_H,
-				       IMX858_REG_VALUE_08BIT,
-				       (ctrl->val + imx858->cur_mode->height)
-				       >> 8);
-		ret |= imx858_write_reg(imx858->client,
-					IMX858_REG_VTS_L,
-					IMX858_REG_VALUE_08BIT,
-					(ctrl->val + imx858->cur_mode->height)
-					& 0xff);
+		// ret = imx858_write_reg(imx858->client,
+		// 		       IMX858_REG_VTS_H,
+		// 		       IMX858_REG_VALUE_08BIT,
+		// 		       (ctrl->val + imx858->cur_mode->height)
+		// 		       >> 8);
+		// ret |= imx858_write_reg(imx858->client,
+		// 			IMX858_REG_VTS_L,
+		// 			IMX858_REG_VALUE_08BIT,
+		// 			(ctrl->val + imx858->cur_mode->height)
+		// 			& 0xff);
 		imx858->cur_vts = ctrl->val + imx858->cur_mode->height;
 
 		dev_dbg(&client->dev, "set vblank 0x%x\n",
@@ -1966,6 +1965,342 @@ static int imx858_configure_regulators(struct imx858 *imx858)//ok for all
 				       imx858->supplies);
 }
 
+// 寄存器地址设置接口
+static ssize_t imx858_debugfs_reg_addr_write(struct file *file,
+                                             const char __user *buf,
+                                             size_t count, loff_t *ppos)
+{
+    struct imx858 *imx858 = file->private_data;
+    char kbuf[16];
+    unsigned int addr;
+    int ret;
+
+    if (count >= sizeof(kbuf))
+        return -EINVAL;
+
+    if (copy_from_user(kbuf, buf, count))
+        return -EFAULT;
+
+    kbuf[count] = '\0';
+    
+    ret = kstrtouint(kbuf, 0, &addr);
+    if (ret)
+        return ret;
+
+    if (addr > 0xFFFF) {
+        dev_err(&imx858->client->dev, "Invalid register address: 0x%x\n", addr);
+        return -EINVAL;
+    }
+
+    imx858->debug_reg_addr = (u16)addr;
+    dev_info(&imx858->client->dev, "Set debug register address to 0x%04x\n", 
+             imx858->debug_reg_addr);
+
+    return count;
+}
+
+static ssize_t imx858_debugfs_reg_addr_read(struct file *file,
+                                            char __user *buf,
+                                            size_t count, loff_t *ppos)
+{
+    struct imx858 *imx858 = file->private_data;
+    char kbuf[32];
+    int len;
+
+    len = snprintf(kbuf, sizeof(kbuf), "0x%04x\n", imx858->debug_reg_addr);
+    
+    return simple_read_from_buffer(buf, count, ppos, kbuf, len);
+}
+
+// 寄存器读取接口
+static ssize_t imx858_debugfs_reg_read(struct file *file,
+                                       char __user *buf,
+                                       size_t count, loff_t *ppos)
+{
+    struct imx858 *imx858 = file->private_data;
+    char kbuf[64];
+    u32 val;
+    int ret, len;
+
+    if (!pm_runtime_get_if_in_use(&imx858->client->dev)) {
+        dev_err(&imx858->client->dev, "Device is not powered on\n");
+        return -ENODEV;
+    }
+
+    ret = imx858_read_reg(imx858->client, imx858->debug_reg_addr,
+                         IMX858_REG_VALUE_08BIT, &val);
+    
+    pm_runtime_put(&imx858->client->dev);
+    
+    if (ret) {
+        dev_err(&imx858->client->dev, "Failed to read register 0x%04x: %d\n",
+                imx858->debug_reg_addr, ret);
+        return ret;
+    }
+
+    len = snprintf(kbuf, sizeof(kbuf), "reg[0x%04x] = 0x%02x (%d)\n",
+                   imx858->debug_reg_addr, val & 0xFF, val & 0xFF);
+
+    dev_info(&imx858->client->dev, "Read reg[0x%04x] = 0x%02x\n",
+             imx858->debug_reg_addr, val & 0xFF);
+
+    return simple_read_from_buffer(buf, count, ppos, kbuf, len);
+}
+
+// 寄存器写入接口
+static ssize_t imx858_debugfs_reg_write(struct file *file,
+                                        const char __user *buf,
+                                        size_t count, loff_t *ppos)
+{
+    struct imx858 *imx858 = file->private_data;
+    char kbuf[16];
+    unsigned int val;
+    int ret;
+
+    if (count >= sizeof(kbuf))
+        return -EINVAL;
+
+    if (copy_from_user(kbuf, buf, count))
+        return -EFAULT;
+
+    kbuf[count] = '\0';
+    
+    ret = kstrtouint(kbuf, 0, &val);
+    if (ret)
+        return ret;
+
+    if (val > 0xFF) {
+        dev_err(&imx858->client->dev, "Invalid register value: 0x%x\n", val);
+        return -EINVAL;
+    }
+
+    if (!pm_runtime_get_if_in_use(&imx858->client->dev)) {
+        dev_err(&imx858->client->dev, "Device is not powered on\n");
+        return -ENODEV;
+    }
+
+    ret = imx858_write_reg(imx858->client, imx858->debug_reg_addr,
+                          IMX858_REG_VALUE_08BIT, val);
+    
+    pm_runtime_put(&imx858->client->dev);
+    
+    if (ret) {
+        dev_err(&imx858->client->dev, "Failed to write register 0x%04x: %d\n",
+                imx858->debug_reg_addr, ret);
+        return ret;
+    }
+
+    dev_info(&imx858->client->dev, "Write reg[0x%04x] = 0x%02x\n",
+             imx858->debug_reg_addr, val & 0xFF);
+
+    return count;
+}
+// 批量寄存器操作接口（修正版）
+static ssize_t imx858_debugfs_reg_batch_write(struct file *file,
+                                              const char __user *buf,
+                                              size_t count, loff_t *ppos)
+{
+    struct imx858 *imx858 = file->private_data;
+    char *kbuf, *ptr, *line_end, *token, *eq;
+    unsigned int addr, val;
+    int ret = 0, total_written = 0;
+
+    kbuf = kzalloc(count + 1, GFP_KERNEL);
+    if (!kbuf)
+        return -ENOMEM;
+
+    if (copy_from_user(kbuf, buf, count)) {
+        ret = -EFAULT;
+        goto out;
+    }
+    kbuf[count] = '\0';
+
+    if (!pm_runtime_get_if_in_use(&imx858->client->dev)) {
+        dev_err(&imx858->client->dev, "Device is not powered on\n");
+        ret = -ENODEV;
+        goto out;
+    }
+
+    ptr = kbuf;
+    
+    // 处理每一行
+    while (ptr && *ptr && ret >= 0) {
+        // 找到行结束符或字符串结束
+        line_end = strchr(ptr, '\n');
+        if (line_end)
+            *line_end = '\0';
+        
+        // 跳过空行和空白字符
+        while (*ptr && isspace(*ptr))
+            ptr++;
+        
+        if (!*ptr) {
+            if (line_end)
+                ptr = line_end + 1;
+            else
+                break;
+            continue;
+        }
+        
+        // 处理当前行中的每个 addr=val 对（用逗号分隔）
+        while (ptr && *ptr && ret >= 0) {
+            // 跳过空白字符
+            while (*ptr && isspace(*ptr))
+                ptr++;
+            
+            if (!*ptr)
+                break;
+                
+            // 找到下一个逗号或行结束
+            token = ptr;
+            while (*ptr && *ptr != ',' && *ptr != '\n' && *ptr != '\0')
+                ptr++;
+            
+            // 如果找到逗号，则用 null 终止当前 token
+            if (*ptr == ',') {
+                *ptr = '\0';
+                ptr++;
+            } else if (*ptr == '\n' || *ptr == '\0') {
+                if (*ptr == '\n')
+                    *ptr = '\0';
+                ptr = NULL; // 表示这是行的最后一个 token
+            }
+            
+            // 跳过 token 开头的空白字符
+            while (*token && isspace(*token))
+                token++;
+            
+            if (!*token)
+                continue;
+            
+            // 查找等号
+            eq = strchr(token, '=');
+            if (!eq) {
+                dev_err(&imx858->client->dev, "Invalid format: %s (missing '=')\n", token);
+                ret = -EINVAL;
+                break;
+            }
+            
+            *eq = '\0';
+            eq++;
+            
+            // 解析地址和值
+            if (kstrtouint(token, 0, &addr) || kstrtouint(eq, 0, &val)) {
+                dev_err(&imx858->client->dev, "Invalid number format: addr=%s, val=%s\n", token, eq);
+                ret = -EINVAL;
+                break;
+            }
+            
+            if (addr > 0xFFFF || val > 0xFF) {
+                dev_err(&imx858->client->dev, "Invalid range: addr=0x%x, val=0x%x\n", addr, val);
+                ret = -EINVAL;
+                break;
+            }
+            
+            // 写入寄存器
+            ret = imx858_write_reg(imx858->client, (u16)addr,
+                                  IMX858_REG_VALUE_08BIT, val);
+            if (ret < 0) {
+                dev_err(&imx858->client->dev, "Failed to write reg[0x%04x]=0x%02x: %d\n",
+                        addr, val, ret);
+                break;
+            }
+                
+            total_written++;
+            dev_info(&imx858->client->dev, "Batch write reg[0x%04x] = 0x%02x\n",
+                     addr, val);
+        }
+        
+        // 移动到下一行
+        if (line_end && ptr == NULL)
+            ptr = line_end + 1;
+        else if (ptr == NULL)
+            break;
+    }
+
+    pm_runtime_put(&imx858->client->dev);
+
+    if (ret >= 0) {
+        dev_info(&imx858->client->dev, "Batch write completed: %d registers\n",
+                 total_written);
+        ret = count;
+    }
+
+out:
+    kfree(kbuf);
+    return ret;
+}
+
+static const struct file_operations imx858_debugfs_reg_addr_fops = {
+    .open = simple_open,
+    .read = imx858_debugfs_reg_addr_read,
+    .write = imx858_debugfs_reg_addr_write,
+    .llseek = default_llseek,
+};
+
+static const struct file_operations imx858_debugfs_reg_read_fops = {
+    .open = simple_open,
+    .read = imx858_debugfs_reg_read,
+    .llseek = default_llseek,
+};
+
+static const struct file_operations imx858_debugfs_reg_write_fops = {
+    .open = simple_open,
+    .write = imx858_debugfs_reg_write,
+    .llseek = default_llseek,
+};
+
+static const struct file_operations imx858_debugfs_reg_batch_fops = {
+    .open = simple_open,
+    .write = imx858_debugfs_reg_batch_write,
+    .llseek = default_llseek,
+};
+
+static int imx858_debugfs_init(struct imx858 *imx858)
+{
+    struct device *dev = &imx858->client->dev;
+    char dirname[32];
+
+    // 创建以设备名称命名的目录
+    snprintf(dirname, sizeof(dirname), "imx858-%s", dev_name(dev));
+    
+    imx858->debugfs_dir = debugfs_create_dir(dirname, NULL);
+    if (IS_ERR_OR_NULL(imx858->debugfs_dir)) {
+        dev_warn(dev, "Failed to create debugfs directory\n");
+        return -ENODEV;
+    }
+
+    // 创建寄存器地址设置接口
+    debugfs_create_file("reg_addr", 0644, imx858->debugfs_dir, imx858,
+                       &imx858_debugfs_reg_addr_fops);
+
+    // 创建寄存器读取接口  
+    debugfs_create_file("reg_read", 0444, imx858->debugfs_dir, imx858,
+                       &imx858_debugfs_reg_read_fops);
+
+    // 创建寄存器写入接口
+    debugfs_create_file("reg_write", 0200, imx858->debugfs_dir, imx858,
+                       &imx858_debugfs_reg_write_fops);
+
+    // 创建批量操作接口
+    debugfs_create_file("reg_batch", 0200, imx858->debugfs_dir, imx858,
+                       &imx858_debugfs_reg_batch_fops);
+
+    // 创建一些只读状态文件
+    debugfs_create_bool("streaming", 0444, imx858->debugfs_dir, &imx858->streaming);
+    debugfs_create_bool("power_on", 0444, imx858->debugfs_dir, &imx858->power_on);
+    debugfs_create_u32("cur_vts", 0444, imx858->debugfs_dir, &imx858->cur_vts);
+
+    dev_info(dev, "debugfs initialized at /sys/kernel/debug/%s\n", dirname);
+    return 0;
+}
+
+static void imx858_debugfs_cleanup(struct imx858 *imx858)
+{
+    debugfs_remove_recursive(imx858->debugfs_dir);
+    imx858->debugfs_dir = NULL;
+}
+
 static int imx858_probe(struct i2c_client *client,
 			const struct i2c_device_id *id)
 {
@@ -2098,6 +2433,7 @@ static int imx858_probe(struct i2c_client *client,
 	ret = __imx858_power_on(imx858);
 	if (ret)
 		goto err_free_handler;
+	imx858->power_on = true;
 
 	ret = imx858_check_sensor_id(imx858, client);
 	if (ret)
@@ -2160,7 +2496,13 @@ continue_probe:
 
 	pm_runtime_set_active(dev);
 	pm_runtime_enable(dev);
-	pm_runtime_idle(dev);
+	// pm_runtime_idle(dev);
+	pm_runtime_get_sync(dev);
+	pm_runtime_get_sync(dev);
+	pm_runtime_put_noidle(dev);
+	ret = imx858_debugfs_init(imx858);
+    if (ret)
+        dev_warn(dev, "Failed to initialize debugfs: %d\n", ret);
 
 	return 0;
 
@@ -2170,6 +2512,7 @@ err_clean_entity:
 #endif
 err_power_off:
 	__imx858_power_off(imx858);
+	imx858->power_on = false;
 err_free_handler:
 	v4l2_ctrl_handler_free(&imx858->ctrl_handler);
 err_destroy_mutex:
@@ -2183,6 +2526,7 @@ static void imx858_remove(struct i2c_client *client)//ok for all
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct imx858 *imx858 = to_imx858(sd);
 
+	imx858_debugfs_cleanup(imx858);
 	v4l2_async_unregister_subdev(sd);
 #if defined(CONFIG_MEDIA_CONTROLLER)
 	media_entity_cleanup(&sd->entity);

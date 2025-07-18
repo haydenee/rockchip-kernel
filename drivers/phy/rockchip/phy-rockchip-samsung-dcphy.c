@@ -5,6 +5,7 @@
  *      Guochun Huang <hero.huang@rock-chips.com>
  */
 
+#include "linux/debugfs.h"
 #include <linux/clk.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
@@ -94,6 +95,73 @@
 #define SKEW_CAL_INIT_RUN_TIME(x)	UPDATE(x, 11, 8)
 #define SKEW_CAL_INIT_WAIT_TIME(x)	UPDATE(x, 7, 4)
 #define SKEW_CAL_EN			BIT(0)
+
+#define COMBO_SD0_GNR_CON0	0x0C00
+#define COMBO_SD0_GNR_CON1	0x0C04
+#define COMBO_SD0_ANA_CON0	0x0C08
+#define COMBO_SD0_ANA_CON1	0x0C0C
+#define COMBO_SD0_ANA_CON2	0x0C10
+#define COMBO_SD0_ANA_CON3	0x0C14
+#define COMBO_SD0_ANA_CON4	0x0C18
+#define COMBO_SD0_ANA_CON6 	0x0C20
+#define COMBO_SD0_ANA_CON7	0x0C24
+#define COMBO_SD0_TIME_CON0	0x0C30
+#define COMBO_SD0_TIME_CON1	0x0C34
+#define COMBO_SD0_DATA_CON0	0x0C38
+#define COMBO_SD0_DESKEW_CON0	0x0C40
+#define COMBO_SD0_DESKEW_CON1	0x0C44
+#define COMBO_SD0_DESKEW_CON2	0x0C48
+#define COMBO_SD0_DESKEW_CON3	0x0C4c
+#define COMBO_SD0_DESKEW_CON4	0x0C50
+#define COMBO_SD0_CRC_CON0		0x0C60
+#define COMBO_SD0_CRC_CON1		0x0C64
+#define COMBO_SD0_CRC_CON2		0x0C68
+
+#define COMBO_SD1_GNR_CON0	0x0D00
+#define COMBO_SD1_GNR_CON1	0x0D04
+#define COMBO_SD1_ANA_CON0	0x0D08
+#define COMBO_SD1_ANA_CON1	0x0D0C
+#define COMBO_SD1_ANA_CON2	0x0D10
+#define COMBO_SD1_ANA_CON3	0x0D14
+#define COMBO_SD1_ANA_CON4	0x0D18
+#define COMBO_SD1_ANA_CON6 	0x0D20
+#define COMBO_SD1_ANA_CON7	0x0D24
+#define COMBO_SD1_TIME_CON0	0x0D30
+#define COMBO_SD1_TIME_CON1	0x0D34
+#define COMBO_SD1_DATA_CON0	0x0D38
+#define COMBO_SD1_DESKEW_CON0	0x0D40
+#define COMBO_SD1_DESKEW_CON1	0x0D44
+#define COMBO_SD1_DESKEW_CON2	0x0D48
+#define COMBO_SD1_DESKEW_CON3	0x0D4c
+#define COMBO_SD1_DESKEW_CON4	0x0D50
+#define COMBO_SD1_CRC_CON0		0x0D60
+#define COMBO_SD1_CRC_CON1		0x0D64
+#define COMBO_SD1_CRC_CON2		0x0D68
+
+
+#define COMBO_SD2_GNR_CON0	0x0E00
+#define COMBO_SD2_GNR_CON1	0x0E04
+#define COMBO_SD2_ANA_CON0	0x0E08
+#define COMBO_SD2_ANA_CON1	0x0E0C
+#define COMBO_SD2_ANA_CON2	0x0E10
+#define COMBO_SD2_ANA_CON3	0x0E14
+#define COMBO_SD2_ANA_CON4	0x0E18
+#define COMBO_SD2_ANA_CON6 	0x0E20
+#define COMBO_SD2_ANA_CON7	0x0E24
+#define COMBO_SD2_TIME_CON0	0x0E30
+#define COMBO_SD2_TIME_CON1	0x0E34
+#define COMBO_SD2_DATA_CON0	0x0E38
+#define COMBO_SD2_DESKEW_CON0	0x0E40
+#define COMBO_SD2_DESKEW_CON1	0x0E44
+#define COMBO_SD2_DESKEW_CON2	0x0E48
+#define COMBO_SD2_DESKEW_CON3	0x0E4c
+#define COMBO_SD2_DESKEW_CON4	0x0E50
+#define COMBO_SD2_CRC_CON0		0x0E60
+#define COMBO_SD2_CRC_CON1		0x0E64
+#define COMBO_SD2_CRC_CON2		0x0E68
+
+
+
 
 #define COMBO_MD0_GNR_CON0	0x0400
 #define COMBO_MD0_GNR_CON1	0x0404
@@ -1273,6 +1341,643 @@ static const struct hsfreq_range samsung_cphy_rx_hsfreq_ranges[] = {
 	{ 250,  0x104}, { 500,  0x102}, { 990, 0x002}, { 2500, 0x001},
 };
 
+static int ths_settle_show(struct seq_file *s, void *unused)
+{
+    struct samsung_mipi_dcphy *samsung = s->private;
+    u32 val0 = 0, val1 = 0, val2 = 0;
+    int ret;
+
+    ret = regmap_read(samsung->regmap, RX_LANE0_THS_SETTLE, &val0);
+    if (ret) {
+        seq_printf(s, "Failed to read RX_LANE0_THS_SETTLE: %d\n", ret);
+        return ret;
+    }
+
+    ret = regmap_read(samsung->regmap, RX_LANE1_THS_SETTLE, &val1);
+    if (ret) {
+        seq_printf(s, "Failed to read RX_LANE1_THS_SETTLE: %d\n", ret);
+        return ret;
+    }
+
+    ret = regmap_read(samsung->regmap, RX_LANE2_THS_SETTLE, &val2);
+    if (ret) {
+        seq_printf(s, "Failed to read RX_LANE2_THS_SETTLE: %d\n", ret);
+        return ret;
+    }
+
+    seq_printf(s, "DCPHY Instance: %s\n", samsung->debugfs_name);
+    seq_printf(s, "Base Address: 0x%08lx\n", (unsigned long)samsung->res->start);
+    seq_printf(s, "RX_LANE0_THS_SETTLE: 0x%03x (reg=0x%08x)\n", val0 & 0x1ff, val0);
+    seq_printf(s, "RX_LANE1_THS_SETTLE: 0x%03x (reg=0x%08x)\n", val1 & 0x1ff, val1);
+    seq_printf(s, "RX_LANE2_THS_SETTLE: 0x%03x (reg=0x%08x)\n", val2 & 0x1ff, val2);
+    seq_printf(s, "\nOverride enable: %s\n", samsung->ths_settle_override_enable ? "true" : "false");
+    if (samsung->ths_settle_override_enable) {
+        seq_printf(s, "Override values:\n");
+        seq_printf(s, "  Lane0: 0x%03x\n", samsung->ths_settle_override[0]);
+        seq_printf(s, "  Lane1: 0x%03x\n", samsung->ths_settle_override[1]);
+        seq_printf(s, "  Lane2: 0x%03x\n", samsung->ths_settle_override[2]);
+    }
+    seq_printf(s, "\nUsage:\n");
+    seq_printf(s, "  echo \"<lane0> <lane1> <lane2>\" > ths_settle\n");
+    seq_printf(s, "  echo \"disable\" > ths_settle  # to disable override\n");
+    seq_printf(s, "  Valid range: 0x000-0x1ff\n");
+
+    return 0;
+}
+
+static int ths_settle_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, ths_settle_show, inode->i_private);
+}
+
+static ssize_t ths_settle_write(struct file *file, const char __user *buf,
+                size_t count, loff_t *ppos)
+{
+    struct samsung_mipi_dcphy *samsung = file->f_inode->i_private;
+    char kbuf[64];
+    u32 lane0, lane1, lane2;
+    int ret;
+
+    if (count >= sizeof(kbuf))
+        return -EINVAL;
+
+    if (copy_from_user(kbuf, buf, count))
+        return -EFAULT;
+
+    kbuf[count] = '\0';
+
+    /* Remove trailing newline */
+    if (count > 0 && kbuf[count - 1] == '\n')
+        kbuf[count - 1] = '\0';
+
+    if (strcmp(kbuf, "disable") == 0) {
+        mutex_lock(&samsung->mutex);
+        samsung->ths_settle_override_enable = false;
+        mutex_unlock(&samsung->mutex);
+        dev_info(samsung->dev, "[%s] THS settle override disabled\n", samsung->debugfs_name);
+        return count;
+    }
+
+    ret = sscanf(kbuf, "%x %x %x", &lane0, &lane1, &lane2);
+    if (ret != 3) {
+        dev_err(samsung->dev, "[%s] Invalid format. Expected: <lane0> <lane1> <lane2> (hex)\n", 
+            samsung->debugfs_name);
+        return -EINVAL;
+    }
+
+    if (lane0 > 0x1ff || lane1 > 0x1ff || lane2 > 0x1ff) {
+        dev_err(samsung->dev, "[%s] Invalid value. Range: 0x000-0x1ff\n", samsung->debugfs_name);
+        return -EINVAL;
+    }
+
+    mutex_lock(&samsung->mutex);
+    samsung->ths_settle_override[0] = lane0;
+    samsung->ths_settle_override[1] = lane1;
+    samsung->ths_settle_override[2] = lane2;
+    samsung->ths_settle_override_enable = true;
+
+    /* Apply the override values immediately if streaming */
+    if (atomic_read(&samsung->stream_cnt) > 0) {
+        regmap_update_bits(samsung->regmap, RX_LANE0_THS_SETTLE, 0x1ff, lane0);
+        regmap_update_bits(samsung->regmap, RX_LANE1_THS_SETTLE, 0x1ff, lane1);
+        regmap_update_bits(samsung->regmap, RX_LANE2_THS_SETTLE, 0x1ff, lane2);
+        dev_info(samsung->dev, "[%s] Applied THS settle override: lane0=0x%03x, lane1=0x%03x, lane2=0x%03x\n",
+             samsung->debugfs_name, lane0, lane1, lane2);
+    }
+    mutex_unlock(&samsung->mutex);
+
+    dev_info(samsung->dev, "[%s] THS settle override set: lane0=0x%03x, lane1=0x%03x, lane2=0x%03x\n",
+         samsung->debugfs_name, lane0, lane1, lane2);
+
+    return count;
+}
+static const struct file_operations ths_settle_fops = {
+    .open = ths_settle_open,
+    .read = seq_read,
+    .write = ths_settle_write,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+
+
+
+static int cphy_status_show(struct seq_file *s, void *unused)
+{
+    struct samsung_mipi_dcphy *samsung = s->private;
+    u32 grf_con0, bias_con4, clk_ready, data0_ready, data1_ready, data2_ready;
+    int ret;
+
+    seq_printf(s, "DCPHY Instance: %s\n", samsung->debugfs_name);
+    seq_printf(s, "Base Address: 0x%08lx\n", (unsigned long)samsung->res->start);
+    seq_printf(s, "\n=== CPHY RX Mode Status ===\n");
+
+    /* Read GRF register for CPHY mode settings */
+    ret = regmap_read(samsung->grf_regmap, MIPI_DCPHY_GRF_CON0, &grf_con0);
+    if (ret) {
+        seq_printf(s, "Failed to read MIPI_DCPHY_GRF_CON0: %d\n", ret);
+        return ret;
+    }
+
+    /* Read BIAS_CON4 for amplitude settings */
+    ret = regmap_read(samsung->regmap, BIAS_CON4, &bias_con4);
+    if (ret) {
+        seq_printf(s, "Failed to read BIAS_CON4: %d\n", ret);
+        return ret;
+    }
+
+    /* Read PHY_READY status for each lane */
+    ret = regmap_read(samsung->regmap, RX_CLK_LANE_ENABLE, &clk_ready);
+    if (ret) {
+        seq_printf(s, "Failed to read RX_CLK_LANE_ENABLE: %d\n", ret);
+        return ret;
+    }
+
+    ret = regmap_read(samsung->regmap, RX_DATA_LANE0_ENABLE, &data0_ready);
+    if (ret) {
+        seq_printf(s, "Failed to read RX_DATA_LANE0_ENABLE: %d\n", ret);
+        return ret;
+    }
+
+    ret = regmap_read(samsung->regmap, RX_DATA_LANE1_ENABLE, &data1_ready);
+    if (ret) {
+        seq_printf(s, "Failed to read RX_DATA_LANE1_ENABLE: %d\n", ret);
+        return ret;
+    }
+
+    ret = regmap_read(samsung->regmap, RX_DATA_LANE2_ENABLE, &data2_ready);
+    if (ret) {
+        seq_printf(s, "Failed to read RX_DATA_LANE2_ENABLE: %d\n", ret);
+        return ret;
+    }
+
+    /* Display CPHY mode status */
+    seq_printf(s, "MIPI_DCPHY_GRF_CON0: 0x%08x\n", grf_con0);
+    seq_printf(s, "  S_CPHY_MODE: %s (bit[3]=%d)\n", 
+               (grf_con0 & BIT(3)) ? "ENABLED" : "DISABLED",
+               !!(grf_con0 & BIT(3)));
+    seq_printf(s, "  M_CPHY_MODE: %s (bit[0]=%d)\n", 
+               (grf_con0 & BIT(0)) ? "ENABLED" : "DISABLED",
+               !!(grf_con0 & BIT(0)));
+
+    /* Display bias amplitude settings */
+    seq_printf(s, "\nBIAS_CON4: 0x%08x\n", bias_con4);
+    seq_printf(s, "  I_MUX_SEL: %d (bits[6:5])\n", (bias_con4 >> 5) & 0x3);
+    seq_printf(s, "  Amplitude: ");
+    switch ((bias_con4 >> 5) & 0x3) {
+    case 0:
+        seq_printf(s, "300mV (DPHY default)\n");
+        break;
+    case 1:
+        seq_printf(s, "400mV (DPHY)\n");
+        break;
+    case 2:
+        seq_printf(s, "530mV (CPHY default)\n");
+        break;
+    case 3:
+        seq_printf(s, "Reserved\n");
+        break;
+    }
+
+    /* Display PHY ready status */
+    seq_printf(s, "\n=== PHY Ready Status ===\n");
+    seq_printf(s, "CLK_LANE:  %s (0x%08x)\n", 
+               (clk_ready & PHY_READY) ? "READY" : "NOT_READY", clk_ready);
+    seq_printf(s, "DATA_LANE0: %s (0x%08x)\n", 
+               (data0_ready & PHY_READY) ? "READY" : "NOT_READY", data0_ready);
+    seq_printf(s, "DATA_LANE1: %s (0x%08x)\n", 
+               (data1_ready & PHY_READY) ? "READY" : "NOT_READY", data1_ready);
+    seq_printf(s, "DATA_LANE2: %s (0x%08x)\n", 
+               (data2_ready & PHY_READY) ? "READY" : "NOT_READY", data2_ready);
+
+    /* Display current operating mode */
+    seq_printf(s, "\n=== Current Status ===\n");
+    seq_printf(s, "Operating Mode: %s\n", samsung->c_option ? "CPHY" : "DPHY");
+    seq_printf(s, "Stream Count: %d\n", atomic_read(&samsung->stream_cnt));
+    seq_printf(s, "Lane Count: %d\n", samsung->lanes);
+    if (samsung->pll.rate > 0)
+        seq_printf(s, "PLL Rate: %llu Hz (%llu Mbps)\n", 
+                   samsung->pll.rate, samsung->pll.rate / 1000000);
+
+    /* CPHY mode validation */
+    seq_printf(s, "\n=== CPHY Mode Validation ===\n");
+    if ((grf_con0 & BIT(3)) && (grf_con0 & BIT(0))) {
+        seq_printf(s, "✓ CPHY mode is properly configured\n");
+    } else {
+        seq_printf(s, "✗ CPHY mode is NOT properly configured\n");
+    }
+
+    if (((bias_con4 >> 5) & 0x3) == 2) {
+        seq_printf(s, "✓ Bias amplitude is set for CPHY (530mV)\n");
+    } else {
+        seq_printf(s, "⚠ Bias amplitude is not optimal for CPHY\n");
+    }
+
+    if ((data0_ready & PHY_READY) && (data1_ready & PHY_READY) && (data2_ready & PHY_READY)) {
+        seq_printf(s, "✓ All CPHY data lanes are ready\n");
+    } else {
+        seq_printf(s, "✗ Some CPHY data lanes are not ready\n");
+    }
+
+    return 0;
+}
+
+static int cphy_status_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, cphy_status_show, inode->i_private);
+}
+
+static const struct file_operations cphy_status_fops = {
+    .open = cphy_status_open,
+    .read = seq_read,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+static int combo_sd_status_show(struct seq_file *s, void *unused)
+{
+    struct samsung_mipi_dcphy *samsung = s->private;
+    struct {
+        const char *name;
+        u32 addr;
+    } regs[] = {
+        // SD0
+        {"COMBO_SD0_GNR_CON0", 0x0C00}, {"COMBO_SD0_GNR_CON1", 0x0C04},
+        {"COMBO_SD0_ANA_CON0", 0x0C08}, {"COMBO_SD0_ANA_CON1", 0x0C0C},
+        {"COMBO_SD0_ANA_CON2", 0x0C10}, {"COMBO_SD0_ANA_CON3", 0x0C14},
+        {"COMBO_SD0_ANA_CON4", 0x0C18}, {"COMBO_SD0_ANA_CON6", 0x0C20},
+        {"COMBO_SD0_ANA_CON7", 0x0C24},
+        {"COMBO_SD0_TIME_CON0", 0x0C30}, {"COMBO_SD0_TIME_CON1", 0x0C34},
+        {"COMBO_SD0_DATA_CON0", 0x0C38},
+        {"COMBO_SD0_DESKEW_CON0", 0x0C40}, {"COMBO_SD0_DESKEW_CON1", 0x0C44},
+        {"COMBO_SD0_DESKEW_CON2", 0x0C48}, {"COMBO_SD0_DESKEW_CON3", 0x0C4c},
+        {"COMBO_SD0_DESKEW_CON4", 0x0C50},
+        {"COMBO_SD0_CRC_CON0", 0x0C60}, {"COMBO_SD0_CRC_CON1", 0x0C64},
+        {"COMBO_SD0_CRC_CON2", 0x0C68},
+        // SD1
+        {"COMBO_SD1_GNR_CON0", 0x0D00}, {"COMBO_SD1_GNR_CON1", 0x0D04},
+        {"COMBO_SD1_ANA_CON0", 0x0D08}, {"COMBO_SD1_ANA_CON1", 0x0D0C},
+        {"COMBO_SD1_ANA_CON2", 0x0D10}, {"COMBO_SD1_ANA_CON3", 0x0D14},
+        {"COMBO_SD1_ANA_CON4", 0x0D18}, {"COMBO_SD1_ANA_CON6", 0x0D20},
+        {"COMBO_SD1_ANA_CON7", 0x0D24},
+        {"COMBO_SD1_TIME_CON0", 0x0D30}, {"COMBO_SD1_TIME_CON1", 0x0D34},
+        {"COMBO_SD1_DATA_CON0", 0x0D38},
+        {"COMBO_SD1_DESKEW_CON0", 0x0D40}, {"COMBO_SD1_DESKEW_CON1", 0x0D44},
+        {"COMBO_SD1_DESKEW_CON2", 0x0D48}, {"COMBO_SD1_DESKEW_CON3", 0x0D4c},
+        {"COMBO_SD1_DESKEW_CON4", 0x0D50},
+        {"COMBO_SD1_CRC_CON0", 0x0D60}, {"COMBO_SD1_CRC_CON1", 0x0D64},
+        {"COMBO_SD1_CRC_CON2", 0x0D68},
+        // SD2
+        {"COMBO_SD2_GNR_CON0", 0x0E00}, {"COMBO_SD2_GNR_CON1", 0x0E04},
+        {"COMBO_SD2_ANA_CON0", 0x0E08}, {"COMBO_SD2_ANA_CON1", 0x0E0C},
+        {"COMBO_SD2_ANA_CON2", 0x0E10}, {"COMBO_SD2_ANA_CON3", 0x0E14},
+        {"COMBO_SD2_ANA_CON4", 0x0E18}, {"COMBO_SD2_ANA_CON6", 0x0E20},
+        {"COMBO_SD2_ANA_CON7", 0x0E24},
+        {"COMBO_SD2_TIME_CON0", 0x0E30}, {"COMBO_SD2_TIME_CON1", 0x0E34},
+        {"COMBO_SD2_DATA_CON0", 0x0E38},
+        {"COMBO_SD2_DESKEW_CON0", 0x0E40}, {"COMBO_SD2_DESKEW_CON1", 0x0E44},
+        {"COMBO_SD2_DESKEW_CON2", 0x0E48}, {"COMBO_SD2_DESKEW_CON3", 0x0E4c},
+        {"COMBO_SD2_DESKEW_CON4", 0x0E50},
+        {"COMBO_SD2_CRC_CON0", 0x0E60}, {"COMBO_SD2_CRC_CON1", 0x0E64},
+        {"COMBO_SD2_CRC_CON2", 0x0E68},
+    };
+    int i, ret;
+    u32 val;
+
+    seq_puts(s, "=== COMBO_SDx Register Status ===\n");
+    for (i = 0; i < ARRAY_SIZE(regs); ++i) {
+        ret = regmap_read(samsung->regmap, regs[i].addr, &val);
+        if (ret)
+            seq_printf(s, "%-24s [0x%04x]: <read error: %d>\n", regs[i].name, regs[i].addr, ret);
+        else
+            seq_printf(s, "%-24s [0x%04x]: 0x%08x\n", regs[i].name, regs[i].addr, val);
+
+        // 分组美化
+        if ((i+1)%20 == 0 && i != 0)
+            seq_puts(s, "\n");
+    }
+    return 0;
+}
+
+static int combo_sd_status_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, combo_sd_status_show, inode->i_private);
+}
+
+static const struct file_operations combo_sd_status_fops = {
+    .open = combo_sd_status_open,
+    .read = seq_read,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+static ssize_t dcphy_debugfs_reg_addr_write(struct file *file,
+                                            const char __user *buf,
+                                            size_t count, loff_t *ppos)
+{
+    struct samsung_mipi_dcphy *samsung = file->private_data;
+    char kbuf[16];
+    unsigned int addr;
+    int ret;
+
+    if (count >= sizeof(kbuf))
+        return -EINVAL;
+
+    if (copy_from_user(kbuf, buf, count))
+        return -EFAULT;
+
+    kbuf[count] = '\0';
+    
+    ret = kstrtouint(kbuf, 0, &addr);
+    if (ret)
+        return ret;
+
+    if (addr > MIPI_DCPHY_MAX_REGISGER) {
+        dev_err(samsung->dev, "Invalid register address: 0x%x\n", addr);
+        return -EINVAL;
+    }
+
+    samsung->debug_reg_addr = addr;
+    dev_info(samsung->dev, "Set debug register address to 0x%04x\n", 
+             samsung->debug_reg_addr);
+
+    return count;
+}
+
+static ssize_t dcphy_debugfs_reg_addr_read(struct file *file,
+                                          char __user *buf,
+                                          size_t count, loff_t *ppos)
+{
+    struct samsung_mipi_dcphy *samsung = file->private_data;
+    char kbuf[32];
+    int len;
+
+    len = snprintf(kbuf, sizeof(kbuf), "0x%04x\n", samsung->debug_reg_addr);
+    
+    return simple_read_from_buffer(buf, count, ppos, kbuf, len);
+}
+
+// 寄存器读取接口
+static ssize_t dcphy_debugfs_reg_read(struct file *file,
+                                     char __user *buf,
+                                     size_t count, loff_t *ppos)
+{
+    struct samsung_mipi_dcphy *samsung = file->private_data;
+    char kbuf[64];
+    u32 val;
+    int ret, len;
+
+    ret = regmap_read(samsung->regmap, samsung->debug_reg_addr, &val);
+    if (ret) {
+        dev_err(samsung->dev, "Failed to read register 0x%04x: %d\n",
+                samsung->debug_reg_addr, ret);
+        return ret;
+    }
+
+    len = snprintf(kbuf, sizeof(kbuf), "reg[0x%04x] = 0x%08x (%d)\n",
+                   samsung->debug_reg_addr, val, val);
+
+    dev_info(samsung->dev, "Read reg[0x%04x] = 0x%08x\n",
+             samsung->debug_reg_addr, val);
+
+    return simple_read_from_buffer(buf, count, ppos, kbuf, len);
+}
+
+// 寄存器写入接口
+static ssize_t dcphy_debugfs_reg_write(struct file *file,
+                                      const char __user *buf,
+                                      size_t count, loff_t *ppos)
+{
+    struct samsung_mipi_dcphy *samsung = file->private_data;
+    char kbuf[16];
+    unsigned int val;
+    int ret;
+
+    if (count >= sizeof(kbuf))
+        return -EINVAL;
+
+    if (copy_from_user(kbuf, buf, count))
+        return -EFAULT;
+
+    kbuf[count] = '\0';
+    
+    ret = kstrtouint(kbuf, 0, &val);
+    if (ret)
+        return ret;
+
+    ret = regmap_write(samsung->regmap, samsung->debug_reg_addr, val);
+    if (ret) {
+        dev_err(samsung->dev, "Failed to write register 0x%04x: %d\n",
+                samsung->debug_reg_addr, ret);
+        return ret;
+    }
+
+    dev_info(samsung->dev, "Write reg[0x%04x] = 0x%08x\n",
+             samsung->debug_reg_addr, val);
+
+    return count;
+}
+
+// 批量寄存器操作接口
+static ssize_t dcphy_debugfs_reg_batch_write(struct file *file,
+                                            const char __user *buf,
+                                            size_t count, loff_t *ppos)
+{
+    struct samsung_mipi_dcphy *samsung = file->private_data;
+    char *kbuf, *ptr, *line_end, *token, *eq;
+    unsigned int addr, val;
+    int ret = 0, total_written = 0;
+
+    kbuf = kzalloc(count + 1, GFP_KERNEL);
+    if (!kbuf)
+        return -ENOMEM;
+
+    if (copy_from_user(kbuf, buf, count)) {
+        ret = -EFAULT;
+        goto out;
+    }
+    kbuf[count] = '\0';
+
+    ptr = kbuf;
+    
+    // 处理每一行
+    while (ptr && *ptr && ret >= 0) {
+        // 找到行结束符或字符串结束
+        line_end = strchr(ptr, '\n');
+        if (line_end)
+            *line_end = '\0';
+        
+        // 跳过空行和空白字符
+        while (*ptr && isspace(*ptr))
+            ptr++;
+        
+        if (!*ptr) {
+            if (line_end)
+                ptr = line_end + 1;
+            else
+                break;
+            continue;
+        }
+        
+        // 处理当前行中的每个 addr=val 对（用逗号分隔）
+        while (ptr && *ptr && ret >= 0) {
+            // 跳过空白字符
+            while (*ptr && isspace(*ptr))
+                ptr++;
+            
+            if (!*ptr)
+                break;
+                
+            // 找到下一个逗号或行结束
+            token = ptr;
+            while (*ptr && *ptr != ',' && *ptr != '\n' && *ptr != '\0')
+                ptr++;
+            
+            // 如果找到逗号，则用 null 终止当前 token
+            if (*ptr == ',') {
+                *ptr = '\0';
+                ptr++;
+            } else if (*ptr == '\n' || *ptr == '\0') {
+                if (*ptr == '\n')
+                    *ptr = '\0';
+                ptr = NULL; // 表示这是行的最后一个 token
+            }
+            
+            // 跳过 token 开头的空白字符
+            while (*token && isspace(*token))
+                token++;
+            
+            if (!*token)
+                continue;
+            
+            // 查找等号
+            eq = strchr(token, '=');
+            if (!eq) {
+                dev_err(samsung->dev, "Invalid format: %s (missing '=')\n", token);
+                ret = -EINVAL;
+                break;
+            }
+            
+            *eq = '\0';
+            eq++;
+            
+            // 解析地址和值
+            if (kstrtouint(token, 0, &addr) || kstrtouint(eq, 0, &val)) {
+                dev_err(samsung->dev, "Invalid number format: addr=%s, val=%s\n", token, eq);
+                ret = -EINVAL;
+                break;
+            }
+            
+            if (addr > MIPI_DCPHY_MAX_REGISGER) {
+                dev_err(samsung->dev, "Invalid register address: 0x%x\n", addr);
+                ret = -EINVAL;
+                break;
+            }
+            
+            // 写入寄存器
+            ret = regmap_write(samsung->regmap, addr, val);
+            if (ret < 0) {
+                dev_err(samsung->dev, "Failed to write reg[0x%04x]=0x%08x: %d\n",
+                        addr, val, ret);
+                break;
+            }
+                
+            total_written++;
+            dev_info(samsung->dev, "Batch write reg[0x%04x] = 0x%08x\n",
+                     addr, val);
+        }
+        
+        // 移动到下一行
+        if (line_end && ptr == NULL)
+            ptr = line_end + 1;
+        else if (ptr == NULL)
+            break;
+    }
+
+    if (ret >= 0) {
+        dev_info(samsung->dev, "Batch write completed: %d registers\n",
+                 total_written);
+        ret = count;
+    }
+
+out:
+    kfree(kbuf);
+    return ret;
+}
+
+static const struct file_operations dcphy_debugfs_reg_addr_fops = {
+    .open = simple_open,
+    .read = dcphy_debugfs_reg_addr_read,
+    .write = dcphy_debugfs_reg_addr_write,
+    .llseek = default_llseek,
+};
+
+static const struct file_operations dcphy_debugfs_reg_read_fops = {
+    .open = simple_open,
+    .read = dcphy_debugfs_reg_read,
+    .llseek = default_llseek,
+};
+
+static const struct file_operations dcphy_debugfs_reg_write_fops = {
+    .open = simple_open,
+    .write = dcphy_debugfs_reg_write,
+    .llseek = default_llseek,
+};
+
+static const struct file_operations dcphy_debugfs_reg_batch_fops = {
+    .open = simple_open,
+    .write = dcphy_debugfs_reg_batch_write,
+    .llseek = default_llseek,
+};
+static void samsung_dcphy_debugfs_init(struct samsung_mipi_dcphy *samsung)
+{
+    /* Create unique name for this instance based on device address */
+    snprintf(samsung->debugfs_name, sizeof(samsung->debugfs_name), 
+         "dcphy@%08lx", (unsigned long)samsung->res->start);
+
+    samsung->debugfs_root = debugfs_create_dir(samsung->debugfs_name, NULL);
+    if (IS_ERR_OR_NULL(samsung->debugfs_root)) {
+        dev_warn(samsung->dev, "Failed to create debugfs directory for %s\n", samsung->debugfs_name);
+        return;
+    }
+
+    debugfs_create_file("ths_settle", 0644, samsung->debugfs_root,
+                samsung, &ths_settle_fops);
+
+	debugfs_create_file("cphy_status", 0444, samsung->debugfs_root,
+                samsung, &cphy_status_fops);
+
+	debugfs_create_file("combo_sd_status", 0444, samsung->debugfs_root,
+                samsung, &combo_sd_status_fops);
+
+	// 新增的寄存器操作接口
+    samsung->debugfs_reg_dir = debugfs_create_dir("reg", samsung->debugfs_root);
+    if (!IS_ERR_OR_NULL(samsung->debugfs_reg_dir)) {
+        // 创建寄存器地址设置接口
+        debugfs_create_file("addr", 0644, samsung->debugfs_reg_dir, samsung,
+                           &dcphy_debugfs_reg_addr_fops);
+
+        // 创建寄存器读取接口  
+        debugfs_create_file("read", 0444, samsung->debugfs_reg_dir, samsung,
+                           &dcphy_debugfs_reg_read_fops);
+
+        // 创建寄存器写入接口
+        debugfs_create_file("write", 0200, samsung->debugfs_reg_dir, samsung,
+                           &dcphy_debugfs_reg_write_fops);
+
+        // 创建批量操作接口
+        debugfs_create_file("batch", 0200, samsung->debugfs_reg_dir, samsung,
+                           &dcphy_debugfs_reg_batch_fops);
+
+        // 创建一些只读状态文件
+        debugfs_create_u32("stream_cnt", 0444, samsung->debugfs_reg_dir, 
+                          (u32*)&samsung->stream_cnt.counter);
+    }
+
+    dev_info(samsung->dev, "debugfs initialized at /sys/kernel/debug/%s/\n", samsung->debugfs_name);
+}
+
+static void samsung_dcphy_debugfs_remove(struct samsung_mipi_dcphy *samsung)
+{
+    debugfs_remove_recursive(samsung->debugfs_root);
+}
 static void samsung_mipi_dcphy_bias_block_enable(struct samsung_mipi_dcphy *samsung,
 						 struct csi2_dphy *csi_dphy)
 {
@@ -1978,6 +2683,7 @@ static void samsung_dcphy_rx_config_settle(struct csi2_dphy *dphy,
 	int num_hsfreq_ranges = 0;
 	int i, hsfreq = 0;
 	u32 sot_sync = 0;
+	u32 readback_val;
 
 	if (sensor->mbus.type == V4L2_MBUS_CSI2_DPHY) {
 		dev_err(dphy->dev, "[HAYDEN] %s: DPHY mode is not supported!\n", __func__);
@@ -2017,21 +2723,49 @@ static void samsung_dcphy_rx_config_settle(struct csi2_dphy *dphy,
 		regmap_write(samsung->regmap, RX_CLK_THS_SETTLE, 0x301);
 
 	if (sensor->lanes > 0x00) {
-		regmap_update_bits(samsung->regmap, RX_LANE0_THS_SETTLE, 0x1ff, hsfreq);
+		u32 settle_val = samsung->ths_settle_override_enable ? 
+                 samsung->ths_settle_override[0] : hsfreq;
+		dev_info(dphy->dev, "[HAYDEN] %s: lane0 settle_val=0x%03x\n",
+			 __func__, settle_val);
+		regmap_update_bits(samsung->regmap, RX_LANE0_THS_SETTLE, 0x1ff, settle_val);
 		regmap_update_bits(samsung->regmap, RX_LANE0_ERR_SOT_SYNC, 0xff, sot_sync);
+		regmap_read(samsung->regmap, RX_LANE0_THS_SETTLE, &readback_val);
+		dev_info(dphy->dev, "[HAYDEN] %s: lane0 readback_val=0x%03x\n",
+			 __func__, readback_val);
 	}
 	if (sensor->lanes > 0x01) {
-		regmap_update_bits(samsung->regmap, RX_LANE1_THS_SETTLE, 0x1ff, hsfreq);
+		u32 settle_val = samsung->ths_settle_override_enable ? 
+                 samsung->ths_settle_override[1] : hsfreq;
+		dev_info(dphy->dev, "[HAYDEN] %s: lane1 settle_val=0x%03x\n",
+			 __func__, settle_val);
+		regmap_update_bits(samsung->regmap, RX_LANE1_THS_SETTLE, 0x1ff, settle_val);
 		regmap_update_bits(samsung->regmap, RX_LANE1_ERR_SOT_SYNC, 0xff, sot_sync);
+		regmap_read(samsung->regmap, RX_LANE1_THS_SETTLE, &readback_val);
+		dev_info(dphy->dev, "[HAYDEN] %s: lane1 readback_val=0x%03x\n",
+			 __func__, readback_val);
 	}
 	if (sensor->lanes > 0x02) {
-		regmap_update_bits(samsung->regmap, RX_LANE2_THS_SETTLE, 0x1ff, hsfreq);
+		u32 settle_val = samsung->ths_settle_override_enable ? 
+                 samsung->ths_settle_override[2] : hsfreq;
+		dev_info(dphy->dev, "[HAYDEN] %s: lane2 settle_val=0x%03x\n",
+			 __func__, settle_val);
+		regmap_update_bits(samsung->regmap, RX_LANE2_THS_SETTLE, 0x1ff, settle_val);
 		regmap_update_bits(samsung->regmap, RX_LANE2_ERR_SOT_SYNC, 0xff, sot_sync);
+		regmap_read(samsung->regmap, RX_LANE2_THS_SETTLE, &readback_val);
+		dev_info(dphy->dev, "[HAYDEN] %s: lane2 readback_val=0x%03x\n",
+			 __func__, readback_val);
 	}
 	if (sensor->lanes > 0x03) {
+		dev_info(dphy->dev, "[HAYDEN] %s: lane3 settle_val=0x%03x\n",
+			 __func__, hsfreq);
 		regmap_update_bits(samsung->regmap, RX_LANE3_THS_SETTLE, 0x1ff, hsfreq);
 		regmap_update_bits(samsung->regmap, RX_LANE3_ERR_SOT_SYNC, 0xff, sot_sync);
 	}
+
+	if (samsung->ths_settle_override_enable) {
+        dev_info(dphy->dev, "Applied THS settle override: lane0=0x%03x, lane1=0x%03x, lane2=0x%03x\n",
+             samsung->ths_settle_override[0], samsung->ths_settle_override[1], samsung->ths_settle_override[2]);
+    }
 }
 
 static int samsung_dcphy_rx_config_common(struct csi2_dphy *dphy,
@@ -2261,6 +2995,8 @@ static int samsung_dcphy_rx_lane_enable(struct csi2_dphy *dphy,
 			return -EINVAL;
 		}
 	}
+
+	dev_info(dphy->dev, "phy rx lane enable done\n");
 	return 0;
 }
 
@@ -2281,7 +3017,7 @@ static int samsung_dcphy_rx_stream_on(struct csi2_dphy *dphy,
 	mutex_lock(&samsung->mutex);
 	if (sensor->mbus.type == V4L2_MBUS_CSI2_CPHY) {
 		dev_info(dphy->dev, "[HAYDEN] %s: CPHY mode is good!\n", __func__);
-		regmap_write(samsung->grf_regmap, MIPI_DCPHY_GRF_CON0, S_CPHY_MODE);
+		regmap_write(samsung->grf_regmap, MIPI_DCPHY_GRF_CON0, S_CPHY_MODE|M_CPHY_MODE);
 		samsung->c_option = true;
 	} else {
 		dev_err(dphy->dev, "[HAYDEN] %s: DPHY mode is not desired!!!\n", __func__);
@@ -2486,14 +3222,14 @@ static int samsung_mipi_dcphy_probe(struct platform_device *pdev)
 	samsung->stream_off = samsung_dcphy_rx_stream_off;
 	mutex_init(&samsung->mutex);
 	pm_runtime_enable(dev);
-
+    samsung_dcphy_debugfs_init(samsung);
 	return 0;
 }
 
 static int samsung_mipi_dcphy_remove(struct platform_device *pdev)
 {
 	struct samsung_mipi_dcphy *samsung = platform_get_drvdata(pdev);
-
+	samsung_dcphy_debugfs_remove(samsung);
 	pm_runtime_disable(samsung->dev);
 	mutex_destroy(&samsung->mutex);
 

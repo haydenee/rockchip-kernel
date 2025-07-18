@@ -5,6 +5,7 @@
  * Copyright (C) 2019 Rockchip Electronics Co., Ltd.
  */
 
+#include "linux/debugfs.h"
 #include <linux/clk.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
@@ -29,6 +30,189 @@ MODULE_PARM_DESC(debug_csi2, "Debug level (0-1)");
 #define read_csihost_reg(base, addr) readl((addr) + (base))
 
 static ATOMIC_NOTIFIER_HEAD(g_csi_host_chain);
+
+
+struct csi2_reg_info {
+    const char *name;
+    u32 offset;
+};
+
+static const struct csi2_reg_info csi2_regs[] = {
+    {"CSIHOST_N_LANES", CSIHOST_N_LANES},
+    {"CSIHOST_DPHY_SHUTDOWNZ", CSIHOST_DPHY_SHUTDOWNZ},
+    {"CSIHOST_PHY_RSTZ", CSIHOST_PHY_RSTZ},
+    {"CSIHOST_RESETN", CSIHOST_RESETN},
+    {"CSIHOST_PHY_STATE", CSIHOST_PHY_STATE},
+    {"CSIHOST_ERR1", CSIHOST_ERR1},
+    {"CSIHOST_ERR2", CSIHOST_ERR2},
+    {"CSIHOST_MSK1", CSIHOST_MSK1},
+    {"CSIHOST_MSK2", CSIHOST_MSK2},
+    {"CSIHOST_CONTROL", CSIHOST_CONTROL},
+};
+
+static int csi2_regs_show(struct seq_file *s, void *v)
+{
+    struct csi2_dev *csi2 = s->private;
+    int i, j;
+    int csi_idx;
+    u32 val;
+
+    seq_printf(s, "CSI2 Registers Status\n");
+    seq_printf(s, "=====================\n\n");
+
+    for (i = 0; i < csi2->csi_info.csi_num; i++) {
+        csi_idx = csi2->csi_info.csi_idx[i];
+        if (!csi2->csi2_hw[csi_idx] || !csi2->csi2_hw[csi_idx]->base) {
+            seq_printf(s, "CSI2 HW[%d]: Not available\n\n", csi_idx);
+            continue;
+        }
+
+        seq_printf(s, "CSI2 HW[%d] (base: 0x%llx):\n", 
+               csi_idx, (u64)csi2->csi2_hw[csi_idx]->res->start);
+        seq_printf(s, "----------------------------------------\n");
+
+        for (j = 0; j < ARRAY_SIZE(csi2_regs); j++) {
+            val = read_csihost_reg(csi2->csi2_hw[csi_idx]->base, 
+                           csi2_regs[j].offset);
+            seq_printf(s, "%-20s (0x%02x): 0x%08x\n",
+                   csi2_regs[j].name, csi2_regs[j].offset, val);
+        }
+        seq_printf(s, "\n");
+    }
+
+    /* Add some useful decoded information */
+    seq_printf(s, "Decoded Information:\n");
+    seq_printf(s, "===================\n");
+    for (i = 0; i < csi2->csi_info.csi_num; i++) {
+        csi_idx = csi2->csi_info.csi_idx[i];
+        if (!csi2->csi2_hw[csi_idx] || !csi2->csi2_hw[csi_idx]->base)
+            continue;
+
+        seq_printf(s, "CSI2 HW[%d]:\n", csi_idx);
+        
+        val = read_csihost_reg(csi2->csi2_hw[csi_idx]->base, CSIHOST_N_LANES);
+        seq_printf(s, "  Number of lanes: %d\n", (val & 0x3) + 1);
+        
+        val = read_csihost_reg(csi2->csi2_hw[csi_idx]->base, CSIHOST_PHY_STATE);
+        seq_printf(s, "  PHY State: 0x%08x\n", val);
+        seq_printf(s, "    DPHY RX Ready: %s\n", (val & 0x1) ? "Yes" : "No");
+        seq_printf(s, "    Clock lane ready: %s\n", (val & 0x10) ? "Yes" : "No");
+        
+        val = read_csihost_reg(csi2->csi2_hw[csi_idx]->base, CSIHOST_CONTROL);
+        seq_printf(s, "  Control: 0x%08x\n", val);
+        seq_printf(s, "    CPHY Enable: %s\n", (val & 0x1) ? "Yes" : "No");
+        seq_printf(s, "    DSI Enable: %s\n", (val & 0x10) ? "Yes" : "No");
+        
+        val = read_csihost_reg(csi2->csi2_hw[csi_idx]->base, CSIHOST_ERR1);
+        if (val) {
+            seq_printf(s, "  Error1: 0x%08x\n", val);
+            if (val & CSIHOST_ERR1_PHYERR_SPTSYNCHS)
+                seq_printf(s, "    SOT Sync Error\n");
+            if (val & CSIHOST_ERR1_ERR_BNDRY_MATCH)
+                seq_printf(s, "    Frame Boundary Match Error\n");
+            if (val & CSIHOST_ERR1_ERR_SEQ)
+                seq_printf(s, "    Frame Sequence Error\n");
+            if (val & CSIHOST_ERR1_ERR_CRC)
+                seq_printf(s, "    CRC Error\n");
+        }
+        
+        val = read_csihost_reg(csi2->csi2_hw[csi_idx]->base, CSIHOST_ERR2);
+        if (val) {
+            seq_printf(s, "  Error2: 0x%08x\n", val);
+            if (val & CSIHOST_ERR2_PHYERR_ESC)
+                seq_printf(s, "    Escape Mode Error\n");
+            if (val & CSIHOST_ERR2_PHYERR_SOTHS)
+                seq_printf(s, "    SOT HS Error\n");
+            if (val & CSIHOST_ERR2_ECC_CORRECTED)
+                seq_printf(s, "    ECC Corrected Error\n");
+        }
+        seq_printf(s, "\n");
+    }
+
+    return 0;
+}
+
+static int csi2_regs_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, csi2_regs_show, inode->i_private);
+}
+
+static const struct file_operations csi2_regs_fops = {
+    .open = csi2_regs_open,
+    .read = seq_read,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+
+static int csi2_err_stats_show(struct seq_file *s, void *v)
+{
+    struct csi2_dev *csi2 = s->private;
+    int i;
+
+    seq_printf(s, "CSI2 Error Statistics\n");
+    seq_printf(s, "====================\n\n");
+
+    seq_printf(s, "SOT Sync Errors: %u\n", csi2->err_list[RK_CSI2_ERR_SOTSYN].cnt);
+    seq_printf(s, "FS/FE Mismatch Errors: %u\n", csi2->err_list[RK_CSI2_ERR_FS_FE_MIS].cnt);
+    seq_printf(s, "Frame Sequence Errors: %u\n", csi2->err_list[RK_CSI2_ERR_FRM_SEQ_ERR].cnt);
+    seq_printf(s, "CRC Once Errors: %u\n", csi2->err_list[RK_CSI2_ERR_CRC_ONCE].cnt);
+    seq_printf(s, "CRC Errors: %u\n", csi2->err_list[RK_CSI2_ERR_CRC].cnt);
+    seq_printf(s, "Total Errors: %u\n", csi2->err_list[RK_CSI2_ERR_ALL].cnt);
+
+    seq_printf(s, "\nStream Info:\n");
+    seq_printf(s, "Stream Count: %d\n", csi2->stream_count);
+    seq_printf(s, "Frame Sync Sequence: %u\n", atomic_read(&csi2->frm_sync_seq));
+    seq_printf(s, "DSI Input Enable: %d\n", csi2->dsi_input_en);
+    seq_printf(s, "Check SOT Sync: %s\n", csi2->is_check_sot_sync ? "Yes" : "No");
+    seq_printf(s, "Detect FS/FE: %s\n", csi2->is_detect_fs_fe ? "Yes" : "No");
+
+    return 0;
+}
+
+static int csi2_err_stats_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, csi2_err_stats_show, inode->i_private);
+}
+
+static const struct file_operations csi2_err_stats_fops = {
+    .open = csi2_err_stats_open,
+    .read = seq_read,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+
+static void csi2_debugfs_init(struct csi2_dev *csi2)
+{
+    struct dentry *dir;
+    char name[32];
+
+    snprintf(name, sizeof(name), "rkcif-mipi-csi2-%s", csi2->dev_name);
+    
+    dir = debugfs_create_dir(name, NULL);
+    if (IS_ERR_OR_NULL(dir)) {
+        dev_warn(csi2->dev, "Failed to create debugfs directory\n");
+        return;
+    }
+
+    csi2->debug_dir = dir;
+
+    debugfs_create_file("registers", 0444, dir, csi2, &csi2_regs_fops);
+    debugfs_create_file("error_stats", 0444, dir, csi2, &csi2_err_stats_fops);
+    
+    /* Add some basic info */
+    debugfs_create_u32("stream_count", 0444, dir, &csi2->stream_count);
+    debugfs_create_bool("check_sot_sync", 0644, dir, &csi2->is_check_sot_sync);
+    debugfs_create_bool("detect_fs_fe", 0644, dir, &csi2->is_detect_fs_fe);
+    debugfs_create_u32("sw_debug", 0644, dir, &csi2->sw_dbg);
+
+    dev_info(csi2->dev, "Created debugfs at /sys/kernel/debug/%s\n", name);
+}
+
+static void csi2_debugfs_cleanup(struct csi2_dev *csi2)
+{
+    debugfs_remove_recursive(csi2->debug_dir);
+    csi2->debug_dir = NULL;
+}
 
 int rkcif_csi2_register_notifier(struct notifier_block *nb)
 {
@@ -1257,6 +1441,8 @@ static int csi2_probe(struct platform_device *pdev)
 	if (ret)
 		goto rmmutex;
 
+	csi2_debugfs_init(csi2);
+
 	v4l2_info(&csi2->sd, "probe success, v4l2_dev:%s!\n", csi2->sd.v4l2_dev->name);
 
 	return 0;
@@ -1270,7 +1456,7 @@ static int csi2_remove(struct platform_device *pdev)
 {
 	struct v4l2_subdev *sd = platform_get_drvdata(pdev);
 	struct csi2_dev *csi2 = sd_to_dev(sd);
-
+    csi2_debugfs_cleanup(csi2);
 	v4l2_async_unregister_subdev(sd);
 	mutex_destroy(&csi2->lock);
 	media_entity_cleanup(&sd->entity);
