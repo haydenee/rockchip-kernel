@@ -621,37 +621,9 @@
 	pinctrl-names = "default";
 	pinctrl-0 = <&i2c2m0_xfer>;
 
-	cam3: imx989@10 {
-		compatible = "sony,imx989";
-		reg = <0x10>;
-		clocks = <&cru CLK_MIPI_CAMARAOUT_M4>;
-		clock-names = "xvclk";
-		power-domains = <&power RK3588_PD_VI>;
-		pinctrl-names = "default";
-		pinctrl-0 = <&mipim0_camera4_clk>;
-		// power-gpios = <&gpio1 RK_PB3 GPIO_ACTIVE_HIGH>;
-		reset-gpios = <&gpio1 RK_PA6 GPIO_ACTIVE_HIGH>;
-		//pwdn-gpios = <&gpio1 RK_PA0 GPIO_ACTIVE_HIGH>;
-		rockchip,camera-module-index = <1>;
-		rockchip,camera-module-facing = "back";
-		rockchip,camera-module-name = "default";
-		rockchip,camera-module-lens-name = "default";
-		// rockchip,spd-id = <1>;  
-   		// rockchip,ebd-id = <2>; 
-		// lens-focus = <&fp5510>;
-		
-		port {
-			imx989_out1: endpoint {
-				remote-endpoint = <&mipi_in_ucam1>;
-				bus-type = <1>;
-				data-lanes = <1 2 3>;
-			};
-		};
-	};
-
-	// cam3: imx858@29 {
-	// 	compatible = "sony,imx858";
-	// 	reg = <0x29>;
+	// cam3: imx989@10 {
+	// 	compatible = "sony,imx989";
+	// 	reg = <0x10>;
 	// 	clocks = <&cru CLK_MIPI_CAMARAOUT_M4>;
 	// 	clock-names = "xvclk";
 	// 	power-domains = <&power RK3588_PD_VI>;
@@ -676,6 +648,34 @@
 	// 		};
 	// 	};
 	// };
+
+	cam3: imx858@29 {
+		compatible = "sony,imx858";
+		reg = <0x29>;
+		clocks = <&cru CLK_MIPI_CAMARAOUT_M4>;
+		clock-names = "xvclk";
+		power-domains = <&power RK3588_PD_VI>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&mipim0_camera4_clk>;
+		// power-gpios = <&gpio1 RK_PB3 GPIO_ACTIVE_HIGH>;
+		reset-gpios = <&gpio1 RK_PA6 GPIO_ACTIVE_HIGH>;
+		//pwdn-gpios = <&gpio1 RK_PA0 GPIO_ACTIVE_HIGH>;
+		rockchip,camera-module-index = <1>;
+		rockchip,camera-module-facing = "back";
+		rockchip,camera-module-name = "default";
+		rockchip,camera-module-lens-name = "default";
+		// rockchip,spd-id = <1>;  
+   		// rockchip,ebd-id = <2>; 
+		// lens-focus = <&fp5510>;
+		
+		port {
+			imx989_out1: endpoint {
+				remote-endpoint = <&mipi_in_ucam1>;
+				bus-type = <1>;
+				data-lanes = <1 2 3>;
+			};
+		};
+	};
 
 
 };
