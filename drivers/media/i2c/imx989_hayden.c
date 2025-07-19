@@ -3045,7 +3045,7 @@ static int imx989_probe(struct i2c_client *client,
 
 	imx989->batch_regs = NULL;
     imx989->batch_reg_count = 0;
-    imx989->apply_batch_on_stream = false;
+    imx989->apply_batch_on_stream = true;
 
 	if (i == imx989->cfg_num)
 		imx989->cur_mode = &supported_modes[0];
