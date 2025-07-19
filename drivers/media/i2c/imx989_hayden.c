@@ -42,14 +42,14 @@
 #define V4L2_CID_DIGITAL_GAIN		V4L2_CID_GAIN
 #endif
 
-// #define IMX989_MIPI_FREQ_1250M			300000000
-#define IMX989_MIPI_FREQ_1250M			450000000
+// #define IMX989_MIPI_FREQ_1300M			300000000
+#define IMX989_MIPI_FREQ_1300M			650000000
 
 #define IMX989_LANES			3
 
-// #define PIXEL_RATE_WITH_1250M_10BIT	((u64)IMX989_MIPI_FREQ_1250M * 2  * 3 / 10)
-#define PIXEL_RATE_WITH_1250M_10BIT	448000000
-#define PIXEL_RATE_WITH_1250M_12BIT	((u64)IMX989_MIPI_FREQ_1250M * 2  * 3 / 12)
+// #define PIXEL_RATE_WITH_1250M_10BIT	((u64)IMX989_MIPI_FREQ_1300M * 2  * 3 / 10)
+// #define PIXEL_RATE_WITH_1250M_10BIT	448000000
+// #define PIXEL_RATE_WITH_1250M_12BIT	((u64)IMX989_MIPI_FREQ_1300M * 2  * 3 / 12)
 
 #define IMX989_XVCLK_FREQ		19200000
 
@@ -143,6 +143,7 @@ struct imx989_mode {
 	const struct regval *reg_list;
 	u32 hdr_mode;
 	u32 mipi_freq_idx;
+	u32 pixel_rate; // pixel rate in Hz
 	const struct other_data *spd;
 	const struct other_data *ebd;
 	u32 vc[PAD_MAX];
@@ -196,6 +197,10 @@ struct imx989 {
     struct dentry *reg_read_file;
     struct dentry *reg_write_file;
     u16 debug_reg_addr;  // 用于存储要操作的寄存器地址
+
+	struct regval *batch_regs;     // 存储 batch 设置的寄存器
+    u32 batch_reg_count;           // batch 寄存器数量
+    bool apply_batch_on_stream;    // 是否在开流时应用 batch 寄存器
 };
 
 #define to_imx989(sd) container_of(sd, struct imx989, subdev)
@@ -524,19 +529,19 @@ static const struct regval imx989_init_regs[] = { //modified to 989!
 	{REG_NULL, 0x00},
 };
 
-static const struct regval imx989_linear_10bit_4096x3072_30fps_pd_on[] = { //modified to 989!
+static const struct regval imx989_linear_10bit_4096x3072_60fps_pd_off[] = { //modified to 989!
 /* Reg_C: OBIN_4K_4096_2304_30FPS_PD_On the fly2 */
 	// MIPI output setting
 	{0x0112, 0x0A},
 	{0x0113, 0x0A},
 	{0x0114, 0x02},
 	// Line Length PCK Setting
-	{0x0342, 0x69},
+	{0x0342, 0x42},
 	{0x0343, 0x00},
 	{0x3152, 0x00},
 	// Frame Length Lines Setting
-	{0x0340, 0x0F},
-	{0x0341, 0xA0},
+	{0x0340, 0x0C},
+	{0x0341, 0x5C},
 	// ROI Setting
 	{0x0344, 0x00},
 	{0x0345, 0x00},
@@ -576,10 +581,10 @@ static const struct regval imx989_linear_10bit_4096x3072_30fps_pd_on[] = { //mod
 	{0x0305, 0x03},
 	{0x0306, 0x00},
 	{0x0307, 0xFC},
-	{0x030B, 0x04},
-	{0x030D, 0x02},
+	{0x030B, 0x02},
+	{0x030D, 0x03},
 	{0x030E, 0x01},
-	{0x030F, 0x77},//625
+	{0x030F, 0x9a},//375
 	// Other Setting
 	{0x312D, 0x00},
 	{0x312E, 0x00},
@@ -851,7 +856,7 @@ static const struct regval imx989_linear_10bit_4096x3072_30fps_pd_on[] = { //mod
 	// {0x3301,0x01},//TXEQ ENable
 	{0x3104, 0x00},//disable pd
 	{0x3968, 0x00},//turn off ebd
-	{0x0601, 0x02},//test pattern
+	// {0x0601, 0x02},//test pattern
 
 	// {0x0860,0x01},
 	// {0x0861,0x2D},
@@ -1185,18 +1190,20 @@ static const struct imx989_mode supported_modes[] = {
 		.height = 2304,
 		.max_fps = {
 			.numerator = 10000,
-			.denominator = 300000,
+			.denominator = 600000,
 		},
 		.exp_def = 8000,
 		.hts_def = 11168,//11168
 		.vts_def = 9624,//12144
 		.bus_fmt = MEDIA_BUS_FMT_SRGGB10_1X10,
 		.global_reg_list = imx989_init_regs,
-		.reg_list = imx989_linear_10bit_4096x3072_30fps_pd_on,
+		.reg_list = imx989_linear_10bit_4096x3072_60fps_pd_off,
 		.spd = &imx989_spd,
 		.ebd = &imx989_ebd,
 		.hdr_mode = NO_HDR,
 		.mipi_freq_idx = 0,
+		// .pixel_rate = 3225600000,
+		.pixel_rate = 4096*2304*65,
 		.vc[PAD0] = 0,
 	},
 	{
@@ -1214,25 +1221,6 @@ static const struct imx989_mode supported_modes[] = {
 		.reg_list = imx989_linear_10bit_1920x1080_30fps_pd_on,
 		.spd = &imx989_spd,
 		.ebd = &imx989_ebd,
-		.hdr_mode = NO_HDR,
-		.mipi_freq_idx = 0,
-		.vc[PAD0] = 0,
-	},
-	{
-		.width = 1920,
-		.height = 1080,
-		.max_fps = {
-			.numerator = 10000,
-			.denominator = 300000,
-		},
-		.exp_def = 8000,
-		.hts_def = 11168,//11168
-		.vts_def = 9624,//12144
-		.bus_fmt = MEDIA_BUS_FMT_SRGGB10_1X10,
-		.global_reg_list = imx989_init_regs,
-		.reg_list = imx989_linear_10bit_1920x1080_30fps_pd_on,
-		// .spd = &imx989_spd,
-		// .ebd = &imx989_ebd,
 		.hdr_mode = NO_HDR,
 		.mipi_freq_idx = 0,
 		.vc[PAD0] = 0,
@@ -1241,7 +1229,7 @@ static const struct imx989_mode supported_modes[] = {
 };
 
 static const s64 link_freq_items[] = {
-	IMX989_MIPI_FREQ_1250M,
+	IMX989_MIPI_FREQ_1300M,
 };
 static const char * const imx989_test_pattern_menu[] = {
 	"Disabled",
@@ -1432,7 +1420,7 @@ static int imx989_set_fmt(struct v4l2_subdev *sd,
 
 		__v4l2_ctrl_s_ctrl(imx989->vblank, vblank_def);
 		__v4l2_ctrl_s_ctrl(imx989->link_freq, mode->mipi_freq_idx);
-		pixel_rate = (u32)link_freq_items[mode->mipi_freq_idx] * 2 * IMX989_LANES / 10 ;
+		pixel_rate = mode->pixel_rate;
 		__v4l2_ctrl_s_ctrl_int64(imx989->pixel_rate,
 					 pixel_rate);
 	}
@@ -1732,17 +1720,9 @@ static long imx989_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)//F
 						 imx989->cur_mode->height,
 						 1, h);
 
-			if (imx989->cur_mode->bus_fmt ==
-			    MEDIA_BUS_FMT_SRGGB10_1X10) {
-				imx989->cur_link_freq = 0;
-				imx989->cur_pixel_rate =
-				PIXEL_RATE_WITH_1250M_10BIT;
-			} else if (imx989->cur_mode->bus_fmt ==
-				   MEDIA_BUS_FMT_SRGGB12_1X12) {
-				imx989->cur_link_freq = 0;
-				imx989->cur_pixel_rate =
-				PIXEL_RATE_WITH_1250M_12BIT;
-			}
+			imx989->cur_link_freq = 0;
+			imx989->cur_pixel_rate = imx989->cur_mode->pixel_rate;
+
 
 			__v4l2_ctrl_s_ctrl_int64(imx989->pixel_rate,
 						 imx989->cur_pixel_rate);
@@ -1907,7 +1887,7 @@ static int imx989_set_flip(struct imx989 *imx989)//FIXME: Don't know 989's regis
 
 	return ret;
 }
-
+static int imx989_apply_batch_regs(struct imx989 *imx989);
 static int __imx989_start_stream(struct imx989 *imx989)// really apply the mode
 {
 	int ret;
@@ -1943,6 +1923,15 @@ static int __imx989_start_stream(struct imx989 *imx989)// really apply the mode
 	}
 
 	imx989_set_flip(imx989);
+
+	if (imx989->apply_batch_on_stream) {
+        ret = imx989_apply_batch_regs(imx989);
+        if (ret) {
+            dev_err(&imx989->client->dev,
+                "Failed to apply batch registers\n");
+            // 继续执行，不要因为 batch 寄存器失败而停止开流
+        }
+    }
 
 	dev_err(&imx989->client->dev,
 		"%s: %dx%d@%d, hts: %d, vts: %d, exp: %d\n",
@@ -2348,17 +2337,12 @@ static int imx989_initialize_controls(struct imx989 *imx989)//ok for 989
 				ARRAY_SIZE(link_freq_items) - 1, 0,
 				link_freq_items);
 
-	if (imx989->cur_mode->bus_fmt == MEDIA_BUS_FMT_SRGGB10_1X10) {
-		imx989->cur_link_freq = 0;
-		imx989->cur_pixel_rate = PIXEL_RATE_WITH_1250M_10BIT;
-	} else if (imx989->cur_mode->bus_fmt == MEDIA_BUS_FMT_SRGGB12_1X12) {
-		imx989->cur_link_freq = 0;
-		imx989->cur_pixel_rate = PIXEL_RATE_WITH_1250M_12BIT;
-	}
+	imx989->cur_link_freq = 0;
+	imx989->cur_pixel_rate = imx989->cur_mode->pixel_rate;
 
 	imx989->pixel_rate = v4l2_ctrl_new_std(handler, NULL,
 					       V4L2_CID_PIXEL_RATE,
-					       0, PIXEL_RATE_WITH_1250M_10BIT,
+					       0, 0x7FFFFFFF,
 					       1, imx989->cur_pixel_rate);
 	v4l2_ctrl_s_ctrl(imx989->link_freq,
 			   imx989->cur_link_freq);
@@ -2450,6 +2434,85 @@ static int imx989_configure_regulators(struct imx989 *imx989)//ok for all
 	return devm_regulator_bulk_get(&imx989->client->dev,
 				       IMX989_NUM_SUPPLIES,
 				       imx989->supplies);
+}
+
+static int imx989_apply_batch_regs(struct imx989 *imx989)
+{
+    int ret = 0;
+    u32 i;
+    
+    if (!imx989->batch_regs || imx989->batch_reg_count == 0)
+        return 0;
+        
+    dev_info(&imx989->client->dev, "Applying %d batch registers\n", 
+             imx989->batch_reg_count);
+    
+    for (i = 0; i < imx989->batch_reg_count; i++) {
+        ret = imx989_write_reg(imx989->client, 
+                              imx989->batch_regs[i].addr,
+                              IMX989_REG_VALUE_08BIT,
+                              imx989->batch_regs[i].val);
+        if (ret < 0) {
+            dev_err(&imx989->client->dev,
+                   "Failed to apply batch reg[0x%04x]=0x%02x: %d\n",
+                   imx989->batch_regs[i].addr, 
+                   imx989->batch_regs[i].val, ret);
+            break;
+        }
+        dev_dbg(&imx989->client->dev, 
+               "Applied batch reg[0x%04x] = 0x%02x\n",
+               imx989->batch_regs[i].addr, imx989->batch_regs[i].val);
+    }
+    
+    return ret;
+}
+
+// 清除 batch 寄存器的函数
+static void imx989_clear_batch_regs(struct imx989 *imx989)
+{
+    if (imx989->batch_regs) {
+        kfree(imx989->batch_regs);
+        imx989->batch_regs = NULL;
+    }
+    imx989->batch_reg_count = 0;
+    dev_info(&imx989->client->dev, "Cleared all batch registers\n");
+}
+
+// 添加寄存器到 batch 列表
+static int imx989_add_batch_reg(struct imx989 *imx989, u16 addr, u8 val)
+{
+    struct regval *new_regs;
+    u32 i;
+    
+    // 检查是否已存在该地址，如果存在则更新值
+    for (i = 0; i < imx989->batch_reg_count; i++) {
+        if (imx989->batch_regs[i].addr == addr) {
+            imx989->batch_regs[i].val = val;
+            dev_info(&imx989->client->dev, 
+                    "Updated batch reg[0x%04x] = 0x%02x\n", addr, val);
+            return 0;
+        }
+    }
+    
+    // 添加新寄存器
+    new_regs = krealloc(imx989->batch_regs,
+                       (imx989->batch_reg_count + 1) * sizeof(struct regval),
+                       GFP_KERNEL);
+    if (!new_regs) {
+        dev_err(&imx989->client->dev, "Failed to allocate memory for batch regs\n");
+        return -ENOMEM;
+    }
+    
+    imx989->batch_regs = new_regs;
+    imx989->batch_regs[imx989->batch_reg_count].addr = addr;
+    imx989->batch_regs[imx989->batch_reg_count].val = val;
+    imx989->batch_reg_count++;
+    
+    dev_info(&imx989->client->dev, 
+            "Added batch reg[0x%04x] = 0x%02x (total: %d)\n", 
+            addr, val, imx989->batch_reg_count);
+    
+    return 0;
 }
 
 // 寄存器地址设置接口
@@ -2582,7 +2645,6 @@ static ssize_t imx989_debugfs_reg_write(struct file *file,
 
     return count;
 }
-// 批量寄存器操作接口（修正版）
 static ssize_t imx989_debugfs_reg_batch_write(struct file *file,
                                               const char __user *buf,
                                               size_t count, loff_t *ppos)
@@ -2591,6 +2653,7 @@ static ssize_t imx989_debugfs_reg_batch_write(struct file *file,
     char *kbuf, *ptr, *line_end, *token, *eq;
     unsigned int addr, val;
     int ret = 0, total_written = 0;
+    bool save_to_batch = false;
 
     kbuf = kzalloc(count + 1, GFP_KERNEL);
     if (!kbuf)
@@ -2602,14 +2665,41 @@ static ssize_t imx989_debugfs_reg_batch_write(struct file *file,
     }
     kbuf[count] = '\0';
 
+    // 检查是否有特殊命令
+    if (strncmp(kbuf, "save", 4) == 0) {
+        save_to_batch = true;
+        ptr = kbuf + 4;
+        while (*ptr && isspace(*ptr)) ptr++; // 跳过空白字符
+        if (*ptr == '\0') {
+            dev_info(&imx989->client->dev, "Save mode enabled for subsequent writes\n");
+            ret = count;
+            goto out;
+        }
+    } else if (strncmp(kbuf, "clear", 5) == 0) {
+        imx989_clear_batch_regs(imx989);
+        ret = count;
+        goto out;
+    } else if (strncmp(kbuf, "apply", 5) == 0) {
+        if (!pm_runtime_get_if_in_use(&imx989->client->dev)) {
+            dev_err(&imx989->client->dev, "Device is not powered on\n");
+            ret = -ENODEV;
+            goto out;
+        }
+        ret = imx989_apply_batch_regs(imx989);
+        pm_runtime_put(&imx989->client->dev);
+        if (ret >= 0)
+            ret = count;
+        goto out;
+    } else {
+        ptr = kbuf;
+    }
+
     if (!pm_runtime_get_if_in_use(&imx989->client->dev)) {
         dev_err(&imx989->client->dev, "Device is not powered on\n");
         ret = -ENODEV;
         goto out;
     }
 
-    ptr = kbuf;
-    
     // 处理每一行
     while (ptr && *ptr && ret >= 0) {
         // 找到行结束符或字符串结束
@@ -2692,10 +2782,19 @@ static ssize_t imx989_debugfs_reg_batch_write(struct file *file,
                         addr, val, ret);
                 break;
             }
+            
+            // 如果是 save 模式，同时保存到 batch 列表
+            if (save_to_batch) {
+                ret = imx989_add_batch_reg(imx989, (u16)addr, (u8)val);
+                if (ret < 0) {
+                    dev_err(&imx989->client->dev, "Failed to save batch reg: %d\n", ret);
+                    break;
+                }
+            }
                 
             total_written++;
-            dev_info(&imx989->client->dev, "Batch write reg[0x%04x] = 0x%02x\n",
-                     addr, val);
+            dev_info(&imx989->client->dev, "Batch write reg[0x%04x] = 0x%02x%s\n",
+                     addr, val, save_to_batch ? " (saved)" : "");
         }
         
         // 移动到下一行
@@ -2708,8 +2807,8 @@ static ssize_t imx989_debugfs_reg_batch_write(struct file *file,
     pm_runtime_put(&imx989->client->dev);
 
     if (ret >= 0) {
-        dev_info(&imx989->client->dev, "Batch write completed: %d registers\n",
-                 total_written);
+        dev_info(&imx989->client->dev, "Batch write completed: %d registers%s\n",
+                 total_written, save_to_batch ? " (saved to batch)" : "");
         ret = count;
     }
 
@@ -2718,6 +2817,101 @@ out:
     return ret;
 }
 
+static ssize_t imx989_debugfs_batch_control_write(struct file *file,
+                                                  const char __user *buf,
+                                                  size_t count, loff_t *ppos)
+{
+    struct imx989 *imx989 = file->private_data;
+    char kbuf[32];
+    int val;
+    int ret;
+
+    if (count >= sizeof(kbuf))
+        return -EINVAL;
+
+    if (copy_from_user(kbuf, buf, count))
+        return -EFAULT;
+
+    kbuf[count] = '\0';
+    
+    ret = kstrtoint(kbuf, 0, &val);
+    if (ret)
+        return ret;
+
+    imx989->apply_batch_on_stream = !!val;
+    dev_info(&imx989->client->dev, "Apply batch on stream: %s\n",
+             imx989->apply_batch_on_stream ? "enabled" : "disabled");
+
+    return count;
+}
+
+static ssize_t imx989_debugfs_batch_control_read(struct file *file,
+                                                 char __user *buf,
+                                                 size_t count, loff_t *ppos)
+{
+    struct imx989 *imx989 = file->private_data;
+    char kbuf[64];
+    int len;
+
+    len = snprintf(kbuf, sizeof(kbuf), "%d (apply on stream: %s)\n",
+                   imx989->apply_batch_on_stream ? 1 : 0,
+                   imx989->apply_batch_on_stream ? "enabled" : "disabled");
+    
+    return simple_read_from_buffer(buf, count, ppos, kbuf, len);
+}
+
+// batch 状态显示接口
+static ssize_t imx989_debugfs_batch_status_read(struct file *file,
+                                                char __user *buf,
+                                                size_t count, loff_t *ppos)
+{
+    struct imx989 *imx989 = file->private_data;
+    char *kbuf;
+    int len = 0, total_len = 0;
+    u32 i;
+    int ret;
+
+    // 估算需要的缓冲区大小
+    total_len = 256 + (imx989->batch_reg_count * 32);
+    kbuf = kzalloc(total_len, GFP_KERNEL);
+    if (!kbuf)
+        return -ENOMEM;
+
+    len += snprintf(kbuf + len, total_len - len,
+                   "Batch register status:\n");
+    len += snprintf(kbuf + len, total_len - len,
+                   "Count: %d\n", imx989->batch_reg_count);
+    len += snprintf(kbuf + len, total_len - len,
+                   "Apply on stream: %s\n\n",
+                   imx989->apply_batch_on_stream ? "enabled" : "disabled");
+
+    if (imx989->batch_reg_count > 0) {
+        len += snprintf(kbuf + len, total_len - len, "Registers:\n");
+        for (i = 0; i < imx989->batch_reg_count; i++) {
+            len += snprintf(kbuf + len, total_len - len,
+                           "  [%d] 0x%04x = 0x%02x\n", i,
+                           imx989->batch_regs[i].addr,
+                           imx989->batch_regs[i].val);
+        }
+    }
+
+    ret = simple_read_from_buffer(buf, count, ppos, kbuf, len);
+    kfree(kbuf);
+    return ret;
+}
+
+static const struct file_operations imx989_debugfs_batch_control_fops = {
+    .open = simple_open,
+    .read = imx989_debugfs_batch_control_read,
+    .write = imx989_debugfs_batch_control_write,
+    .llseek = default_llseek,
+};
+
+static const struct file_operations imx989_debugfs_batch_status_fops = {
+    .open = simple_open,
+    .read = imx989_debugfs_batch_status_read,
+    .llseek = default_llseek,
+};
 static const struct file_operations imx989_debugfs_reg_addr_fops = {
     .open = simple_open,
     .read = imx989_debugfs_reg_addr_read,
@@ -2773,6 +2967,12 @@ static int imx989_debugfs_init(struct imx989 *imx989)
     debugfs_create_file("reg_batch", 0200, imx989->debugfs_dir, imx989,
                        &imx989_debugfs_reg_batch_fops);
 
+	debugfs_create_file("batch_control", 0644, imx989->debugfs_dir, imx989,
+                       &imx989_debugfs_batch_control_fops);
+
+    debugfs_create_file("batch_status", 0444, imx989->debugfs_dir, imx989,
+                       &imx989_debugfs_batch_status_fops);
+
     // 创建一些只读状态文件
     debugfs_create_bool("streaming", 0444, imx989->debugfs_dir, &imx989->streaming);
     debugfs_create_bool("power_on", 0444, imx989->debugfs_dir, &imx989->power_on);
@@ -2803,6 +3003,7 @@ static int imx989_probe(struct i2c_client *client,
 	struct v4l2_subdev *eeprom_ctrl;
 	struct otp_info *otp_ptr;
 	struct device_node *ep;
+	
 
 
 	dev_info(dev, "driver version: %02x.%02x.%02x",
@@ -2841,6 +3042,10 @@ static int imx989_probe(struct i2c_client *client,
 			break;
 		}
 	}
+
+	imx989->batch_regs = NULL;
+    imx989->batch_reg_count = 0;
+    imx989->apply_batch_on_stream = false;
 
 	if (i == imx989->cfg_num)
 		imx989->cur_mode = &supported_modes[0];
@@ -3008,6 +3213,7 @@ static void imx989_remove(struct i2c_client *client)//ok for all
 {
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct imx989 *imx989 = to_imx989(sd);
+	imx989_clear_batch_regs(imx989);
 	imx989_debugfs_cleanup(imx989);
 	v4l2_async_unregister_subdev(sd);
 #if defined(CONFIG_MEDIA_CONTROLLER)

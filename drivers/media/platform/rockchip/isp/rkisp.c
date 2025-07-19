@@ -4903,7 +4903,7 @@ vs_skip:
 			writel(CIF_ISP_PIC_SIZE_ERROR, base + CIF_ISP_ICR);
 			isp_err = readl(base + CIF_ISP_ERR);
 			v4l2_err(&dev->v4l2_dev,
-				 "CIF_ISP_PIC_SIZE_ERROR (0x%08x)", isp_err);
+				 "[HAYDEN] CIF_ISP_PIC_SIZE_ERROR (0x%08x)", isp_err);
 			writel(isp_err, base + CIF_ISP_ERR_CLR);
 		}
 
