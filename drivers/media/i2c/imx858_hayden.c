@@ -584,7 +584,7 @@ static const struct regval imx858_init_regs[] = { //modified to 858!
 	{REG_NULL, 0x00},
 };
 
-static const struct regval imx858_linear_10bit_4096x2304_30fps_pd_on[] = { //modified to 858!
+static const struct regval imx858_linear_10bit_4096x2304_60fps_pd_off[] = { //modified to 858!
 // MIPI output setting
 	{0x0112, 0x0A},
 	{0x0113, 0x0A},
@@ -727,14 +727,14 @@ static const struct imx858_mode supported_modes[] = {
 		.height = 2304,
 		.max_fps = {
 			.numerator = 10000,
-			.denominator = 300000,
+			.denominator = 600000,
 		},
 		.exp_def = 0x0f00,
 		.hts_def = 0x1d4c,//7500
 		.vts_def = 0x0f3e,//3902
 		.bus_fmt = MEDIA_BUS_FMT_SRGGB10_1X10,
 		.global_reg_list = imx858_init_regs,
-		.reg_list = imx858_linear_10bit_4096x2304_30fps_pd_on,
+		.reg_list = imx858_linear_10bit_4096x2304_60fps_pd_off,
 		.pixel_rate = ((u64)219600000*4*10)/8,
 		// .spd = &imx858_spd,
 		// .ebd = &imx858_ebd,
