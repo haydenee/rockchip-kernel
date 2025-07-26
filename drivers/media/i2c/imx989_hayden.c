@@ -143,7 +143,7 @@ struct imx989_mode {
 	const struct regval *reg_list;
 	u32 hdr_mode;
 	u32 mipi_freq_idx;
-	u32 pixel_rate; // pixel rate in Hz
+	u64 pixel_rate; // pixel rate in Hz
 	const struct other_data *spd;
 	const struct other_data *ebd;
 	u32 vc[PAD_MAX];
@@ -1203,7 +1203,7 @@ static const struct imx989_mode supported_modes[] = {
 		.hdr_mode = NO_HDR,
 		.mipi_freq_idx = 0,
 		// .pixel_rate = 3225600000,
-		.pixel_rate = 4096*2304*65,
+		.pixel_rate = ((u64)4096*2304*65*10)/8,
 		.vc[PAD0] = 0,
 	},
 	{

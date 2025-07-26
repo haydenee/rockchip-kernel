@@ -50,9 +50,6 @@
 
 #define IMX858_LANES			3
 
-#define PIXEL_RATE_WITH_1250M_10BIT	((u64)IMX858_MIPI_FREQ_1300M * 2  * 4 / 10)
-#define PIXEL_RATE_WITH_1250M_12BIT	((u64)IMX858_MIPI_FREQ_1300M * 2  * 4 / 12)
-
 #define IMX858_XVCLK_FREQ		24000000
 
 #define CHIP_ID				0x0858
@@ -146,6 +143,7 @@ struct imx858_mode {
 	const struct regval *reg_list;
 	u32 hdr_mode;
 	u32 mipi_freq_idx;
+	u32 pixel_rate; // pixel rate in Hz
 	const struct other_data *spd;
 	const struct other_data *ebd;
 	u32 vc[PAD_MAX];
@@ -737,6 +735,7 @@ static const struct imx858_mode supported_modes[] = {
 		.bus_fmt = MEDIA_BUS_FMT_SRGGB10_1X10,
 		.global_reg_list = imx858_init_regs,
 		.reg_list = imx858_linear_10bit_4096x2304_30fps_pd_on,
+		.pixel_rate = 4096*2304*65,
 		// .spd = &imx858_spd,
 		// .ebd = &imx858_ebd,
 		.hdr_mode = NO_HDR,
@@ -1268,12 +1267,12 @@ static long imx858_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)//F
 			    MEDIA_BUS_FMT_SRGGB10_1X10) {
 				imx858->cur_link_freq = 0;
 				imx858->cur_pixel_rate =
-				PIXEL_RATE_WITH_1250M_10BIT;
+				imx858->cur_mode->pixel_rate;
 			} else if (imx858->cur_mode->bus_fmt ==
 				   MEDIA_BUS_FMT_SRGGB12_1X12) {
 				imx858->cur_link_freq = 0;
 				imx858->cur_pixel_rate =
-				PIXEL_RATE_WITH_1250M_12BIT;
+				imx858->cur_mode->pixel_rate;
 			}
 
 			__v4l2_ctrl_s_ctrl_int64(imx858->pixel_rate,
@@ -1879,15 +1878,15 @@ static int imx858_initialize_controls(struct imx858 *imx858)//ok for 989
 
 	if (imx858->cur_mode->bus_fmt == MEDIA_BUS_FMT_SRGGB10_1X10) {
 		imx858->cur_link_freq = 0;
-		imx858->cur_pixel_rate = PIXEL_RATE_WITH_1250M_10BIT;
+		imx858->cur_pixel_rate = imx858->cur_mode->pixel_rate;
 	} else if (imx858->cur_mode->bus_fmt == MEDIA_BUS_FMT_SRGGB12_1X12) {
 		imx858->cur_link_freq = 0;
-		imx858->cur_pixel_rate = PIXEL_RATE_WITH_1250M_12BIT;
+		imx858->cur_pixel_rate = imx858->cur_mode->pixel_rate;
 	}
 
 	imx858->pixel_rate = v4l2_ctrl_new_std(handler, NULL,
 					       V4L2_CID_PIXEL_RATE,
-					       0, PIXEL_RATE_WITH_1250M_10BIT,
+					       0, 0x7FFFFFFF,
 					       1, imx858->cur_pixel_rate);
 	v4l2_ctrl_s_ctrl(imx858->link_freq,
 			   imx858->cur_link_freq);
