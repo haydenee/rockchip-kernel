@@ -2584,6 +2584,10 @@ static int imx858_probe(struct i2c_client *client,
 		}
 	}
 
+	imx858->batch_regs = NULL;
+    imx858->batch_reg_count = 0;
+    imx858->apply_batch_on_stream = true;
+
 	if (i == imx858->cfg_num)
 		imx858->cur_mode = &supported_modes[0];
 
