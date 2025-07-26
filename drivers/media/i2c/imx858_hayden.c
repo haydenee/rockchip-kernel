@@ -43,15 +43,15 @@
 #define V4L2_CID_DIGITAL_GAIN		V4L2_CID_GAIN
 #endif
 
-#define IMX858_MIPI_FREQ_356M			356000000
-#define IMX858_MIPI_FREQ_384M			384000000
-#define IMX858_MIPI_FREQ_750M			750000000
-#define IMX858_MIPI_FREQ_1250M			450000000
+// #define IMX858_MIPI_FREQ_356M			356000000
+// #define IMX858_MIPI_FREQ_384M			384000000
+// #define IMX858_MIPI_FREQ_750M			750000000
+#define IMX858_MIPI_FREQ_1300M			650000000
 
 #define IMX858_LANES			3
 
-#define PIXEL_RATE_WITH_1250M_10BIT	((u64)IMX858_MIPI_FREQ_356M * 2  * 4 / 10)
-#define PIXEL_RATE_WITH_1250M_12BIT	((u64)IMX858_MIPI_FREQ_356M * 2  * 4 / 12)
+#define PIXEL_RATE_WITH_1250M_10BIT	((u64)IMX858_MIPI_FREQ_1300M * 2  * 4 / 10)
+#define PIXEL_RATE_WITH_1250M_12BIT	((u64)IMX858_MIPI_FREQ_1300M * 2  * 4 / 12)
 
 #define IMX858_XVCLK_FREQ		24000000
 
@@ -199,6 +199,10 @@ struct imx858 {
     struct dentry *reg_read_file;
     struct dentry *reg_write_file;
     u16 debug_reg_addr;  // 用于存储要操作的寄存器地址
+
+	struct regval *batch_regs;     // 存储 batch 设置的寄存器
+    u32 batch_reg_count;           // batch 寄存器数量
+    bool apply_batch_on_stream;    // 是否在开流时应用 batch 寄存器
 };
 
 #define to_imx858(sd) container_of(sd, struct imx858, subdev)
@@ -589,13 +593,13 @@ static const struct regval imx858_linear_10bit_4096x2304_30fps_pd_on[] = { //mod
 	{0x0114, 0x02},
 	{0x3239, 0x00},
 // Line Length PCK Setting
-	{0x0342, 0x24},
-	{0x0343, 0x26},
+	{0x0342, 0x1D},
+	{0x0343, 0x4C},
 	{0x3850, 0x03},
 	{0x3851, 0x34},
 // Frame Length Lines Setting
-	{0x0340, 0x0C},
-	{0x0341, 0x5C},
+	{0x0340, 0x0F},
+	{0x0341, 0x3E},
 // ROI Setting
 	{0x0344, 0x00},
 	{0x0345, 0x00},
@@ -633,14 +637,14 @@ static const struct regval imx858_linear_10bit_4096x2304_30fps_pd_on[] = { //mod
 	{0x034F, 0x00},
 // Clock Setting
 	{0x0301, 0x05},
-	{0x0303, 0x04},
+	{0x0303, 0x02},
 	{0x0305, 0x02},
 	{0x0306, 0x00},
 	{0x0307, 0xB7},
-	{0x030B, 0x04},
+	{0x030B, 0x02},
 	{0x030D, 0x02},
-	{0x030E, 0x01},
-	{0x030F, 0x2C},
+	{0x030E, 0x00},
+	{0x030F, 0xE1},
 // Other Setting
 	{0x3104, 0x01},
 	{0x324C, 0x01},
@@ -689,12 +693,12 @@ static const struct regval imx858_linear_10bit_4096x2304_30fps_pd_on[] = { //mod
 	{0x020E, 0x01},
 	{0x020F, 0x00},
 // PHASE PIX VCID Setting
+	{0x30A4, 0x00},
+	{0x30A6, 0x00},
 	{0x30F2, 0x01},
 	{0x30F3, 0x01},
 // PHASE PIX data type Setting
-	{0x30A4, 0x00},
 	{0x30A5, 0x30},
-	{0x30A6, 0x00},
 	{0x30A7, 0x30},
 // MIPI Global Timing Setting
 	// {0x084E, 0x00},
@@ -707,8 +711,8 @@ static const struct regval imx858_linear_10bit_4096x2304_30fps_pd_on[] = { //mod
 	// {0x0855, 0x29},
 	// {0x0858, 0x00},
 	// {0x0859, 0x1F},
-	
-	{0x0601, 0x02},//test pattern
+
+	// {0x0601, 0x02},//test pattern
 	{REG_NULL, 0x00},
 };
 static const struct imx858_mode supported_modes[] = {
@@ -737,7 +741,7 @@ static const s64 link_freq_items[] = {
 	// IMX858_MIPI_FREQ_356M,
 	// IMX858_MIPI_FREQ_384M,
 	// IMX858_MIPI_FREQ_750M,
-	IMX858_MIPI_FREQ_1250M,
+	IMX858_MIPI_FREQ_1300M,
 };
 static const char * const imx858_test_pattern_menu[] = {
 	"Disabled",
@@ -1427,7 +1431,7 @@ static int imx858_set_flip(struct imx858 *imx858)//FIXME: Don't know 989's regis
 
 	return ret;
 }
-
+static int imx858_apply_batch_regs(struct imx858 *imx858);
 static int __imx858_start_stream(struct imx858 *imx858)// really apply the mode
 {
 	int ret;
@@ -1463,6 +1467,15 @@ static int __imx858_start_stream(struct imx858 *imx858)// really apply the mode
 	}
 
 	imx858_set_flip(imx858);
+	
+	if (imx858->apply_batch_on_stream) {
+        ret = imx858_apply_batch_regs(imx858);
+        if (ret) {
+            dev_err(&imx858->client->dev,
+                "Failed to apply batch registers\n");
+            // 继续执行，不要因为 batch 寄存器失败而停止开流
+        }
+    }
 
 	return imx858_write_reg(imx858->client, IMX858_REG_CTRL_MODE,
 				IMX858_REG_VALUE_08BIT, IMX858_MODE_STREAMING);
@@ -1965,6 +1978,85 @@ static int imx858_configure_regulators(struct imx858 *imx858)//ok for all
 				       imx858->supplies);
 }
 
+static int imx858_apply_batch_regs(struct imx858 *imx858)
+{
+    int ret = 0;
+    u32 i;
+    
+    if (!imx858->batch_regs || imx858->batch_reg_count == 0)
+        return 0;
+        
+    dev_info(&imx858->client->dev, "Applying %d batch registers\n", 
+             imx858->batch_reg_count);
+    
+    for (i = 0; i < imx858->batch_reg_count; i++) {
+        ret = imx858_write_reg(imx858->client, 
+                              imx858->batch_regs[i].addr,
+                              IMX858_REG_VALUE_08BIT,
+                              imx858->batch_regs[i].val);
+        if (ret < 0) {
+            dev_err(&imx858->client->dev,
+                   "Failed to apply batch reg[0x%04x]=0x%02x: %d\n",
+                   imx858->batch_regs[i].addr, 
+                   imx858->batch_regs[i].val, ret);
+            break;
+        }
+        dev_dbg(&imx858->client->dev, 
+               "Applied batch reg[0x%04x] = 0x%02x\n",
+               imx858->batch_regs[i].addr, imx858->batch_regs[i].val);
+    }
+    
+    return ret;
+}
+
+// 清除 batch 寄存器的函数
+static void imx858_clear_batch_regs(struct imx858 *imx858)
+{
+    if (imx858->batch_regs) {
+        kfree(imx858->batch_regs);
+        imx858->batch_regs = NULL;
+    }
+    imx858->batch_reg_count = 0;
+    dev_info(&imx858->client->dev, "Cleared all batch registers\n");
+}
+
+// 添加寄存器到 batch 列表
+static int imx858_add_batch_reg(struct imx858 *imx858, u16 addr, u8 val)
+{
+    struct regval *new_regs;
+    u32 i;
+    
+    // 检查是否已存在该地址，如果存在则更新值
+    for (i = 0; i < imx858->batch_reg_count; i++) {
+        if (imx858->batch_regs[i].addr == addr) {
+            imx858->batch_regs[i].val = val;
+            dev_info(&imx858->client->dev, 
+                    "Updated batch reg[0x%04x] = 0x%02x\n", addr, val);
+            return 0;
+        }
+    }
+    
+    // 添加新寄存器
+    new_regs = krealloc(imx858->batch_regs,
+                       (imx858->batch_reg_count + 1) * sizeof(struct regval),
+                       GFP_KERNEL);
+    if (!new_regs) {
+        dev_err(&imx858->client->dev, "Failed to allocate memory for batch regs\n");
+        return -ENOMEM;
+    }
+    
+    imx858->batch_regs = new_regs;
+    imx858->batch_regs[imx858->batch_reg_count].addr = addr;
+    imx858->batch_regs[imx858->batch_reg_count].val = val;
+    imx858->batch_reg_count++;
+    
+    dev_info(&imx858->client->dev, 
+            "Added batch reg[0x%04x] = 0x%02x (total: %d)\n", 
+            addr, val, imx858->batch_reg_count);
+    
+    return 0;
+}
+
 // 寄存器地址设置接口
 static ssize_t imx858_debugfs_reg_addr_write(struct file *file,
                                              const char __user *buf,
@@ -2095,7 +2187,6 @@ static ssize_t imx858_debugfs_reg_write(struct file *file,
 
     return count;
 }
-// 批量寄存器操作接口（修正版）
 static ssize_t imx858_debugfs_reg_batch_write(struct file *file,
                                               const char __user *buf,
                                               size_t count, loff_t *ppos)
@@ -2104,6 +2195,7 @@ static ssize_t imx858_debugfs_reg_batch_write(struct file *file,
     char *kbuf, *ptr, *line_end, *token, *eq;
     unsigned int addr, val;
     int ret = 0, total_written = 0;
+    bool save_to_batch = false;
 
     kbuf = kzalloc(count + 1, GFP_KERNEL);
     if (!kbuf)
@@ -2115,14 +2207,41 @@ static ssize_t imx858_debugfs_reg_batch_write(struct file *file,
     }
     kbuf[count] = '\0';
 
+    // 检查是否有特殊命令
+    if (strncmp(kbuf, "save", 4) == 0) {
+        save_to_batch = true;
+        ptr = kbuf + 4;
+        while (*ptr && isspace(*ptr)) ptr++; // 跳过空白字符
+        if (*ptr == '\0') {
+            dev_info(&imx858->client->dev, "Save mode enabled for subsequent writes\n");
+            ret = count;
+            goto out;
+        }
+    } else if (strncmp(kbuf, "clear", 5) == 0) {
+        imx858_clear_batch_regs(imx858);
+        ret = count;
+        goto out;
+    } else if (strncmp(kbuf, "apply", 5) == 0) {
+        if (!pm_runtime_get_if_in_use(&imx858->client->dev)) {
+            dev_err(&imx858->client->dev, "Device is not powered on\n");
+            ret = -ENODEV;
+            goto out;
+        }
+        ret = imx858_apply_batch_regs(imx858);
+        pm_runtime_put(&imx858->client->dev);
+        if (ret >= 0)
+            ret = count;
+        goto out;
+    } else {
+        ptr = kbuf;
+    }
+
     if (!pm_runtime_get_if_in_use(&imx858->client->dev)) {
         dev_err(&imx858->client->dev, "Device is not powered on\n");
         ret = -ENODEV;
         goto out;
     }
 
-    ptr = kbuf;
-    
     // 处理每一行
     while (ptr && *ptr && ret >= 0) {
         // 找到行结束符或字符串结束
@@ -2205,10 +2324,19 @@ static ssize_t imx858_debugfs_reg_batch_write(struct file *file,
                         addr, val, ret);
                 break;
             }
+            
+            // 如果是 save 模式，同时保存到 batch 列表
+            if (save_to_batch) {
+                ret = imx858_add_batch_reg(imx858, (u16)addr, (u8)val);
+                if (ret < 0) {
+                    dev_err(&imx858->client->dev, "Failed to save batch reg: %d\n", ret);
+                    break;
+                }
+            }
                 
             total_written++;
-            dev_info(&imx858->client->dev, "Batch write reg[0x%04x] = 0x%02x\n",
-                     addr, val);
+            dev_info(&imx858->client->dev, "Batch write reg[0x%04x] = 0x%02x%s\n",
+                     addr, val, save_to_batch ? " (saved)" : "");
         }
         
         // 移动到下一行
@@ -2221,8 +2349,8 @@ static ssize_t imx858_debugfs_reg_batch_write(struct file *file,
     pm_runtime_put(&imx858->client->dev);
 
     if (ret >= 0) {
-        dev_info(&imx858->client->dev, "Batch write completed: %d registers\n",
-                 total_written);
+        dev_info(&imx858->client->dev, "Batch write completed: %d registers%s\n",
+                 total_written, save_to_batch ? " (saved to batch)" : "");
         ret = count;
     }
 
@@ -2231,6 +2359,101 @@ out:
     return ret;
 }
 
+static ssize_t imx858_debugfs_batch_control_write(struct file *file,
+                                                  const char __user *buf,
+                                                  size_t count, loff_t *ppos)
+{
+    struct imx858 *imx858 = file->private_data;
+    char kbuf[32];
+    int val;
+    int ret;
+
+    if (count >= sizeof(kbuf))
+        return -EINVAL;
+
+    if (copy_from_user(kbuf, buf, count))
+        return -EFAULT;
+
+    kbuf[count] = '\0';
+    
+    ret = kstrtoint(kbuf, 0, &val);
+    if (ret)
+        return ret;
+
+    imx858->apply_batch_on_stream = !!val;
+    dev_info(&imx858->client->dev, "Apply batch on stream: %s\n",
+             imx858->apply_batch_on_stream ? "enabled" : "disabled");
+
+    return count;
+}
+
+static ssize_t imx858_debugfs_batch_control_read(struct file *file,
+                                                 char __user *buf,
+                                                 size_t count, loff_t *ppos)
+{
+    struct imx858 *imx858 = file->private_data;
+    char kbuf[64];
+    int len;
+
+    len = snprintf(kbuf, sizeof(kbuf), "%d (apply on stream: %s)\n",
+                   imx858->apply_batch_on_stream ? 1 : 0,
+                   imx858->apply_batch_on_stream ? "enabled" : "disabled");
+    
+    return simple_read_from_buffer(buf, count, ppos, kbuf, len);
+}
+
+// batch 状态显示接口
+static ssize_t imx858_debugfs_batch_status_read(struct file *file,
+                                                char __user *buf,
+                                                size_t count, loff_t *ppos)
+{
+    struct imx858 *imx858 = file->private_data;
+    char *kbuf;
+    int len = 0, total_len = 0;
+    u32 i;
+    int ret;
+
+    // 估算需要的缓冲区大小
+    total_len = 256 + (imx858->batch_reg_count * 32);
+    kbuf = kzalloc(total_len, GFP_KERNEL);
+    if (!kbuf)
+        return -ENOMEM;
+
+    len += snprintf(kbuf + len, total_len - len,
+                   "Batch register status:\n");
+    len += snprintf(kbuf + len, total_len - len,
+                   "Count: %d\n", imx858->batch_reg_count);
+    len += snprintf(kbuf + len, total_len - len,
+                   "Apply on stream: %s\n\n",
+                   imx858->apply_batch_on_stream ? "enabled" : "disabled");
+
+    if (imx858->batch_reg_count > 0) {
+        len += snprintf(kbuf + len, total_len - len, "Registers:\n");
+        for (i = 0; i < imx858->batch_reg_count; i++) {
+            len += snprintf(kbuf + len, total_len - len,
+                           "  [%d] 0x%04x = 0x%02x\n", i,
+                           imx858->batch_regs[i].addr,
+                           imx858->batch_regs[i].val);
+        }
+    }
+
+    ret = simple_read_from_buffer(buf, count, ppos, kbuf, len);
+    kfree(kbuf);
+    return ret;
+}
+
+static const struct file_operations imx858_debugfs_batch_control_fops = {
+    .open = simple_open,
+    .read = imx858_debugfs_batch_control_read,
+    .write = imx858_debugfs_batch_control_write,
+    .llseek = default_llseek,
+};
+
+static const struct file_operations imx858_debugfs_batch_status_fops = {
+    .open = simple_open,
+    .read = imx858_debugfs_batch_status_read,
+    .llseek = default_llseek,
+};
 static const struct file_operations imx858_debugfs_reg_addr_fops = {
     .open = simple_open,
     .read = imx858_debugfs_reg_addr_read,
@@ -2285,6 +2508,12 @@ static int imx858_debugfs_init(struct imx858 *imx858)
     // 创建批量操作接口
     debugfs_create_file("reg_batch", 0200, imx858->debugfs_dir, imx858,
                        &imx858_debugfs_reg_batch_fops);
+
+	debugfs_create_file("batch_control", 0644, imx858->debugfs_dir, imx858,
+                       &imx858_debugfs_batch_control_fops);
+
+    debugfs_create_file("batch_status", 0444, imx858->debugfs_dir, imx858,
+                       &imx858_debugfs_batch_status_fops);
 
     // 创建一些只读状态文件
     debugfs_create_bool("streaming", 0444, imx858->debugfs_dir, &imx858->streaming);
@@ -2500,6 +2729,7 @@ continue_probe:
 	pm_runtime_get_sync(dev);
 	pm_runtime_get_sync(dev);
 	pm_runtime_put_noidle(dev);
+
 	ret = imx858_debugfs_init(imx858);
     if (ret)
         dev_warn(dev, "Failed to initialize debugfs: %d\n", ret);
