@@ -670,7 +670,7 @@
 		rockchip,camera-module-lens-name = "default";
 		// rockchip,spd-id = <1>;  
    		// rockchip,ebd-id = <2>; 
-		// lens-focus = <&fp5510>;
+		lens-focus = <&vcm3>;
 		
 		port {
 			imx989_out1: endpoint {
@@ -681,6 +681,11 @@
 		};
 	};
 
+	vcm3: gt9764@c {
+		compatible = "mediatek,gt9764";
+		reg = <0x0c>;
+		status = "okay";
+	};
 
 };
 
