@@ -594,7 +594,7 @@ static const struct regval imx858_linear_10bit_4096x2304_30fps_pd_on[] = { //mod
 	{0x0342, 0x12},
 	{0x0343, 0x08},
 	{0x3850, 0x01},
-	{0x3851, 0xF9},
+	{0x3851, 0xF8},
 // Frame Length Lines Setting
 	{0x0340, 0x0C},
 	{0x0341, 0x48},
@@ -735,7 +735,7 @@ static const struct imx858_mode supported_modes[] = {
 		.bus_fmt = MEDIA_BUS_FMT_SRGGB10_1X10,
 		.global_reg_list = imx858_init_regs,
 		.reg_list = imx858_linear_10bit_4096x2304_30fps_pd_on,
-		.pixel_rate = 4096*2304*65,
+		.pixel_rate = ((u64)219600000*4*10)/8,
 		// .spd = &imx858_spd,
 		// .ebd = &imx858_ebd,
 		.hdr_mode = NO_HDR,
