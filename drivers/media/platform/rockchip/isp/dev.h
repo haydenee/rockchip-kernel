@@ -319,6 +319,8 @@ struct rkisp_device {
 	u8 rawaf_irq_cnt;
 	u8 unite_index;
 	u8 unite_div;
+
+	struct dentry *debugfs_dir;
 };
 
 void rkisp_vicap_hw_link(struct rkisp_device *dev, int on);

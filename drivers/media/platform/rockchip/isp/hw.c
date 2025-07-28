@@ -1530,11 +1530,19 @@ static int __maybe_unused rkisp_runtime_resume(struct device *dev)
 	enable_sys_clk(hw_dev);
 	if (dev->power.runtime_status) {
 		if (!hw_dev->is_assigned_clk) {
+			dev_info(dev, "is_assigned_clk false, use default lowest\n");
 			unsigned long rate = hw_dev->clk_rate_tbl[0].clk_rate * 1000000UL;
 
 			rkisp_set_clk_rate(hw_dev->clks[0], rate);
+			dev_info(dev, "set isp clk rate: %ld\n", rate);
 			if (hw_dev->unite == ISP_UNITE_TWO)
+			{
+				dev_info(dev, "set unite isp clk rate: %ld\n", rate);
 				rkisp_set_clk_rate(hw_dev->clks[5], rate);
+			}
+		}
+		else {
+			dev_info(dev, "use assigned-clock-rates for isp clk\n");
 		}
 		for (i = 0; i < hw_dev->dev_num; i++) {
 			isp = hw_dev->isp[i];

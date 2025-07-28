@@ -32,6 +32,7 @@
  * SOFTWARE.
  */
 
+#include "linux/debugfs.h"
 #include <linux/clk.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
@@ -58,6 +59,9 @@
 int rkisp_debug;
 module_param_named(debug, rkisp_debug, int, 0644);
 MODULE_PARM_DESC(debug, "Debug level (0-1)");
+
+static unsigned long rkisp_override_clk_rate = 0;
+static struct dentry *rkisp_debugfs_root;
 
 bool rkisp_monitor;
 module_param_named(monitor, rkisp_monitor, bool, 0644);
@@ -112,8 +116,15 @@ static LIST_HEAD(rkisp_device_list);
 
 void rkisp_set_clk_rate(struct clk *clk, unsigned long rate)
 {
-	if (rkisp_clk_dbg)
-		return;
+	if (rkisp_clk_dbg) {
+        if (rkisp_override_clk_rate)
+		{
+			printk("[HAYDEN] %s: using override clk rate %lu\n", __func__, rkisp_override_clk_rate);
+            rate = rkisp_override_clk_rate;
+		}
+        // else
+            // return;
+    }
 
 	clk_set_rate(clk, rate);
 }
@@ -197,6 +208,9 @@ static int __isp_pipeline_s_isp_clk(struct rkisp_pipeline *p)
 	u64 data_rate = 0;
 	int i, fps, size;
 
+	v4l2_dbg(0, rkisp_debug, &dev->v4l2_dev,
+			"[HAYDEN] %s: isp_inp=0x%x, dev_id=%d\n", __func__, dev->isp_inp, dev->dev_id);
+
 	hw_dev->isp_size[dev->dev_id].is_on = true;
 	if (hw_dev->is_runing) {
 		if (dev->isp_ver >= ISP_V30 && !rkisp_clk_dbg)
@@ -214,6 +228,9 @@ static int __isp_pipeline_s_isp_clk(struct rkisp_pipeline *p)
 					fps = 30;
 				size = hw_dev->isp_size[i].size * hw_dev->isp[i]->unite_div;
 				data_rate += (fps * size);
+				v4l2_dbg(0, rkisp_debug, &dev->v4l2_dev,
+						"[HAYDEN] %s: dev_id=%d, fps=%d, size=%d, data_rate+=%llu\n",
+						__func__, i, fps, size, data_rate);
 			}
 		} else {
 			i = dev->dev_id;
@@ -222,6 +239,9 @@ static int __isp_pipeline_s_isp_clk(struct rkisp_pipeline *p)
 				fps = 30;
 			size = hw_dev->isp_size[i].size * dev->unite_div;
 			data_rate = fps * size;
+			v4l2_dbg(0, rkisp_debug, &dev->v4l2_dev,
+					"[HAYDEN] %s: dev_id=%d, fps=%d, size=%d, data_rate=%llu\n",
+					__func__, i, fps, size, data_rate);
 		}
 		goto end;
 	}
@@ -264,6 +284,8 @@ end:
 
 	/* increase 25% margin */
 	data_rate += data_rate >> 2;
+	v4l2_dbg(0, rkisp_debug, &dev->v4l2_dev,
+			"[HAYDEN] %s: data_rate=%llu, increased 25 percent margin\n", __func__, data_rate);
 
 	/* compare with isp clock adjustment table */
 	for (i = 0; i < hw_dev->num_clk_rate_tbl; i++)
@@ -271,7 +293,10 @@ end:
 			break;
 	if (i == hw_dev->num_clk_rate_tbl)
 		i--;
-
+	
+	v4l2_dbg(0, rkisp_debug, &dev->v4l2_dev,
+			"[HAYDEN] %s: isp clk rate index=%d, actual matched clk_rate=%uMHz\n",
+			__func__, i, hw_dev->clk_rate_tbl[i].clk_rate);
 	/* set isp clock rate */
 	rkisp_set_clk_rate(hw_dev->clks[0], hw_dev->clk_rate_tbl[i].clk_rate * 1000000UL);
 	if (hw_dev->unite == ISP_UNITE_TWO)
@@ -879,6 +904,147 @@ static int rkisp_get_reserved_mem(struct rkisp_device *isp_dev)
 	return ret;
 }
 
+
+// Debugfs functions
+static int rkisp_clk_rate_show(struct seq_file *s, void *data)
+{
+    struct rkisp_device *dev = s->private;
+    struct rkisp_hw_dev *hw_dev = dev->hw_dev;
+    unsigned long current_rate = 0;
+    int i;
+
+    if (hw_dev->clks[0])
+        current_rate = clk_get_rate(hw_dev->clks[0]);
+
+    seq_printf(s, "Current ISP clock rate: %lu Hz (%lu MHz)\n", 
+           current_rate, current_rate / 1000000);
+    seq_printf(s, "Clock debug mode: %s\n", rkisp_clk_dbg ? "enabled" : "disabled");
+    seq_printf(s, "Override rate: %lu Hz (%lu MHz)\n", 
+           rkisp_override_clk_rate, rkisp_override_clk_rate / 1000000);
+    
+    seq_printf(s, "\nAvailable clock rates:\n");
+    for (i = 0; i < hw_dev->num_clk_rate_tbl; i++) {
+        seq_printf(s, "  %d: %u MHz\n", i, hw_dev->clk_rate_tbl[i].clk_rate);
+    }
+    
+    seq_printf(s, "\nUsage:\n");
+    seq_printf(s, "  # Enable clock debug mode first\n");
+    seq_printf(s, "  echo 1 > /sys/module/rockchipdrm/parameters/clk_dbg\n");
+    seq_printf(s, "  # Set override rate (in Hz)\n");
+    seq_printf(s, "  echo 400000000 > override_rate\n");
+    seq_printf(s, "  # Disable override (use auto calculation)\n");
+    seq_printf(s, "  echo 0 > override_rate\n");
+    
+    return 0;
+}
+
+static int rkisp_clk_rate_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, rkisp_clk_rate_show, inode->i_private);
+}
+
+static ssize_t rkisp_override_rate_write(struct file *file, const char __user *buf,
+                     size_t count, loff_t *ppos)
+{
+    struct rkisp_device *dev = file->f_inode->i_private;
+    struct rkisp_hw_dev *hw_dev = dev->hw_dev;
+    unsigned long rate;
+    char kbuf[32];
+    int ret;
+
+    if (count >= sizeof(kbuf))
+        return -EINVAL;
+
+    if (copy_from_user(kbuf, buf, count))
+        return -EFAULT;
+
+    kbuf[count] = '\0';
+    ret = kstrtoul(kbuf, 0, &rate);
+    if (ret)
+        return ret;
+
+    if (rate && rate < 100000000) {  // Minimum 100MHz
+        dev_warn(dev->dev, "Clock rate too low, minimum 100MHz\n");
+        return -EINVAL;
+    }
+
+    if (rate && rate > 1000000000) { // Maximum 1GHz
+        dev_warn(dev->dev, "Clock rate too high, maximum 1GHz\n");
+        return -EINVAL;
+    }
+
+    rkisp_override_clk_rate = rate;
+    
+    if (rate) {
+        rkisp_clk_dbg = true;
+        dev_info(dev->dev, "ISP clock override set to %lu Hz (%lu MHz)\n", 
+             rate, rate / 1000000);
+        
+        // Apply immediately if ISP is running
+        if (hw_dev->is_runing && hw_dev->clks[0]) {
+            rkisp_set_clk_rate(hw_dev->clks[0], rate);
+            if (hw_dev->unite == ISP_UNITE_TWO)
+                rkisp_set_clk_rate(hw_dev->clks[5], rate);
+            if (dev->isp_ver == ISP_V32 || dev->isp_ver == ISP_V33)
+                rkisp_set_clk_rate(hw_dev->clks[1], rate);
+            dev_info(dev->dev, "Applied override: actual rate = %luHz\n", 
+                clk_get_rate(hw_dev->clks[0]));
+        }
+    } else {
+        dev_info(dev->dev, "ISP clock override disabled\n");
+    }
+
+    return count;
+}
+
+static const struct file_operations rkisp_clk_rate_fops = {
+    .open = rkisp_clk_rate_open,
+    .read = seq_read,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+
+static const struct file_operations rkisp_override_rate_fops = {
+    .open = simple_open,
+    .write = rkisp_override_rate_write,
+    .llseek = default_llseek,
+};
+
+static void rkisp_debugfs_init(struct rkisp_device *dev)
+{
+    struct dentry *dir;
+    char name[32];
+
+    if (!rkisp_debugfs_root) {
+        rkisp_debugfs_root = debugfs_create_dir("rkisp", NULL);
+        if (IS_ERR_OR_NULL(rkisp_debugfs_root)) {
+            dev_warn(dev->dev, "Failed to create debugfs root\n");
+            return;
+        }
+    }
+
+    snprintf(name, sizeof(name), "isp%d", dev->dev_id);
+    dir = debugfs_create_dir(name, rkisp_debugfs_root);
+    if (IS_ERR_OR_NULL(dir)) {
+        dev_warn(dev->dev, "Failed to create debugfs dir for %s\n", name);
+        return;
+    }
+
+    dev->debugfs_dir = dir;
+
+    debugfs_create_file("clk_info", 0444, dir, dev, &rkisp_clk_rate_fops);
+    debugfs_create_file("override_rate", 0200, dir, dev, &rkisp_override_rate_fops);
+    debugfs_create_bool("clk_debug", 0644, dir, &rkisp_clk_dbg);
+
+    dev_info(dev->dev, "Created debugfs interface at /sys/kernel/debug/rkisp/%s/\n", name);
+}
+
+static void rkisp_debugfs_cleanup(struct rkisp_device *dev)
+{
+    debugfs_remove_recursive(dev->debugfs_dir);
+    dev->debugfs_dir = NULL;
+}
+
 static int rkisp_plat_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -978,6 +1144,7 @@ static int rkisp_plat_probe(struct platform_device *pdev)
 	of_property_read_u32(dev->of_node, "wait-line", &rkisp_wait_line);
 
 	rkisp_proc_init(isp_dev);
+	rkisp_debugfs_init(isp_dev);
 
 	mutex_lock(&rkisp_dev_mutex);
 	list_add_tail(&isp_dev->list, &rkisp_device_list);
@@ -1001,6 +1168,7 @@ static int rkisp_plat_remove(struct platform_device *pdev)
 
 	pm_runtime_disable(&pdev->dev);
 
+    rkisp_debugfs_cleanup(isp_dev);
 	rkisp_proc_cleanup(isp_dev);
 	media_device_unregister(&isp_dev->media_dev);
 	v4l2_async_nf_unregister(&isp_dev->notifier);

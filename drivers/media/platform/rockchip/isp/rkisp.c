@@ -546,6 +546,10 @@ static void rkisp_dvfs(struct rkisp_device *dev)
 		i--;
 
 	/* set isp clock rate */
+	v4l2_info(&dev->v4l2_dev,
+			"[HAYDEN] %s:isp clock rate %uMHz, data rate %lluMbps, fps %d, size %d\n",
+			__func__, hw->clk_rate_tbl[i].clk_rate, data_rate, fps, size);
+
 	rkisp_set_clk_rate(hw->clks[0], hw->clk_rate_tbl[i].clk_rate * 1000000UL);
 	if (hw->unite == ISP_UNITE_TWO)
 		rkisp_set_clk_rate(hw->clks[5], hw->clk_rate_tbl[i].clk_rate * 1000000UL);
@@ -2293,6 +2297,9 @@ static int rkisp_isp_stop(struct rkisp_device *dev)
 		old_rate = clk_get_rate(hw->clks[0]);
 		safe_rate = hw->clk_rate_tbl[0].clk_rate * 1000000UL;
 		if (old_rate > safe_rate) {
+			v4l2_info(&dev->v4l2_dev,
+				  "%s: isp_clk %lu now, set to safe rate %lu\n",
+				  __func__, old_rate, safe_rate);
 			rkisp_set_clk_rate(hw->clks[0], safe_rate);
 			if (hw->unite == ISP_UNITE_TWO)
 				rkisp_set_clk_rate(hw->clks[5], safe_rate);
