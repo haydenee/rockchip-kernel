@@ -741,19 +741,19 @@
 
 	port {
 		mipi_lvds1_sditf: endpoint {
-			remote-endpoint = <&isp0_vir1>;
+			remote-endpoint = <&isp1_vir0>;
 		};
 	};
 };
 
-&rkisp0_vir1 {
+&rkisp1_vir0 {
 	status = "okay";
 
 	port {
 		#address-cells = <1>;
 		#size-cells = <0>;
 
-		isp0_vir1: endpoint@0 {
+		isp1_vir0: endpoint@0 {
 			reg = <0>;
 			remote-endpoint = <&mipi_lvds1_sditf>;
 		};

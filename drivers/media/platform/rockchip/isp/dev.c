@@ -1023,7 +1023,9 @@ static void rkisp_debugfs_init(struct rkisp_device *dev)
         }
     }
 
-    snprintf(name, sizeof(name), "isp%d", dev->dev_id);
+    // Use the device name to create unique directory names
+    // This will create names like "rkisp0-vir0", "rkisp1-vir0", etc.
+    snprintf(name, sizeof(name), "%s", dev_name(dev->dev));
     dir = debugfs_create_dir(name, rkisp_debugfs_root);
     if (IS_ERR_OR_NULL(dir)) {
         dev_warn(dev->dev, "Failed to create debugfs dir for %s\n", name);
