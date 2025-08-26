@@ -4505,6 +4505,7 @@
 			      "rst_cif_host0", "rst_cif_host1", "rst_cif_host2",
 			      "rst_cif_host3", "rst_cif_host4", "rst_cif_host5";
 		assigned-clocks = <&cru DCLK_VICAP>;
+		// assigned-clock-rates = <1200000000>; //HAYDEN OVERCLOCK
 		assigned-clock-rates = <600000000>;
 		power-domains = <&power RK3588_PD_VI>;
 		rockchip,grf = <&sys_grf>;

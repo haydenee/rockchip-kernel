@@ -160,6 +160,128 @@ static int ak7375_init_controls(struct ak7375_device *dev_vcm)
 	return hdl->error;
 }
 
+static int ak7375_probe(struct i2c_client *client)
+{
+	struct ak7375_device *ak7375_dev;
+	int ret;
+
+	ak7375_dev = devm_kzalloc(&client->dev, sizeof(*ak7375_dev),
+				  GFP_KERNEL);
+	if (!ak7375_dev)
+		return -ENOMEM;
+
+	v4l2_i2c_subdev_init(&ak7375_dev->sd, client, &ak7375_ops);
+	ak7375_dev->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
+	ak7375_dev->sd.internal_ops = &ak7375_int_ops;
+	ak7375_dev->sd.entity.function = MEDIA_ENT_F_LENS;
+
+	ret = ak7375_init_controls(ak7375_dev);
+	if (ret)
+		goto err_cleanup;
+
+	ret = media_entity_pads_init(&ak7375_dev->sd.entity, 0, NULL);
+	if (ret < 0)
+		goto err_cleanup;
+
+	ret = v4l2_async_register_subdev(&ak7375_dev->sd);
+	if (ret < 0)
+		goto err_cleanup;
+
+	pm_runtime_set_active(&client->dev);
+	pm_runtime_enable(&client->dev);
+	pm_runtime_idle(&client->dev);
+
+	return 0;
+
+err_cleanup:
+	v4l2_ctrl_handler_free(&ak7375_dev->ctrls_vcm);
+	media_entity_cleanup(&ak7375_dev->sd.entity);
+
+	return ret;
+}
+
+static void ak7375_remove(struct i2c_client *client)
+{
+	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+	struct ak7375_device *ak7375_dev = sd_to_ak7375_vcm(sd);
+
+	ak7375_subdev_cleanup(ak7375_dev);
+	pm_runtime_disable(&client->dev);
+	pm_runtime_set_suspended(&client->dev);
+}
+
+/*
+ * This function sets the vcm position, so it consumes least current
+ * The lens position is gradually moved in units of AK7375_CTRL_STEPS,
+ * to make the movements smoothly.
+ */
+static int __maybe_unused ak7375_vcm_suspend(struct device *dev)
+{
+	struct v4l2_subdev *sd = dev_get_drvdata(dev);
+	struct ak7375_device *ak7375_dev = sd_to_ak7375_vcm(sd);
+	int ret, val;
+
+	if (!ak7375_dev->active)
+		return 0;
+
+	for (val = ak7375_dev->focus->val & ~(AK7375_CTRL_STEPS - 1);
+	     val >= 0; val -= AK7375_CTRL_STEPS) {
+		ret = ak7375_i2c_write(ak7375_dev, AK7375_REG_POSITION,
+				       val << 4, 2);
+		if (ret)
+			dev_err_once(dev, "%s I2C failure: %d\n",
+				     __func__, ret);
+		usleep_range(AK7375_CTRL_DELAY_US, AK7375_CTRL_DELAY_US + 10);
+	}
+
+	ret = ak7375_i2c_write(ak7375_dev, AK7375_REG_CONT,
+			       AK7375_MODE_STANDBY, 1);
+	if (ret)
+		dev_err(dev, "%s I2C failure: %d\n", __func__, ret);
+
+	ak7375_dev->active = false;
+
+	return 0;
+}
+
+/*
+ * This function sets the vcm position to the value set by the user
+ * through v4l2_ctrl_ops s_ctrl handler
+ * The lens position is gradually moved in units of AK7375_CTRL_STEPS,
+ * to make the movements smoothly.
+ */
+static int __maybe_unused ak7375_vcm_resume(struct device *dev)
+{
+	struct v4l2_subdev *sd = dev_get_drvdata(dev);
+	struct ak7375_device *ak7375_dev = sd_to_ak7375_vcm(sd);
+	int ret, val;
+
+	if (ak7375_dev->active)
+		return 0;
+
+	ret = ak7375_i2c_write(ak7375_dev, AK7375_REG_CONT,
+		AK7375_MODE_ACTIVE, 1);
+	if (ret) {
+		dev_err(dev, "%s I2C failure: %d\n", __func__, ret);
+		return ret;
+	}
+
+	for (val = ak7375_dev->focus->val % AK7375_CTRL_STEPS;
+	     val <= ak7375_dev->focus->val;
+	     val += AK7375_CTRL_STEPS) {
+		ret = ak7375_i2c_write(ak7375_dev, AK7375_REG_POSITION,
+				       val << 4, 2);
+		if (ret)
+			dev_err_ratelimited(dev, "%s I2C failure: %d\n",
+						__func__, ret);
+		usleep_range(AK7375_CTRL_DELAY_US, AK7375_CTRL_DELAY_US + 10);
+	}
+
+	ak7375_dev->active = true;
+
+	return 0;
+}
+
 static ssize_t ak7375_debugfs_position_read(struct file *file, char __user *buf,
 					     size_t count, loff_t *ppos)
 {
@@ -361,13 +483,6 @@ static int ak7375_probe(struct i2c_client *client)
 	if (ret < 0)
 		goto err_cleanup;
 
-	/* Initialize debugfs */
-	ret = ak7375_debugfs_init(ak7375_dev);
-	if (ret) {
-		LOG_INF("Failed to initialize debugfs: %d\n", ret);
-		/* Continue even if debugfs fails */
-	}
-
 	pm_runtime_set_active(&client->dev);
 	pm_runtime_enable(&client->dev);
 	pm_runtime_idle(&client->dev);
@@ -386,7 +501,6 @@ static void ak7375_remove(struct i2c_client *client)
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct ak7375_device *ak7375_dev = sd_to_ak7375_vcm(sd);
 
-	ak7375_debugfs_cleanup(ak7375_dev);
 	ak7375_subdev_cleanup(ak7375_dev);
 	pm_runtime_disable(&client->dev);
 	pm_runtime_set_suspended(&client->dev);

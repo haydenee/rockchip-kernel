@@ -2909,8 +2909,8 @@ err_clean_entity:
 	media_entity_cleanup(&sd->entity);
 #endif
 err_power_off:
-	__imx858_power_off(imx858);
-	imx858->power_on = false;
+	// __imx858_power_off(imx858);
+	// imx858->power_on = false;
 err_free_handler:
 	v4l2_ctrl_handler_free(&imx858->ctrl_handler);
 err_destroy_mutex:

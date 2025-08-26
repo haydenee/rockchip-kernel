@@ -106,6 +106,7 @@ obj-$(CONFIG_VIDEO_IMX577) += imx577.o
 obj-$(CONFIG_VIDEO_IMX586) += imx586.o
 obj-$(CONFIG_VIDEO_IMX989) += imx989_hayden.o
 obj-$(CONFIG_VIDEO_IMX858) += imx858_hayden.o
+obj-$(CONFIG_VIDEO_IMX766) += imx766_hayden.o
 obj-$(CONFIG_VIDEO_IMX766) += imx766.o
 obj-$(CONFIG_VIDEO_IR_I2C) += ir-kbd-i2c.o
 obj-$(CONFIG_VIDEO_ISL7998X) += isl7998x.o
