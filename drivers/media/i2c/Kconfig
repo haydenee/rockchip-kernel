@@ -828,6 +828,26 @@ config VIDEO_IMX766
 	  This is a Video4Linux2 sensor driver for the Sony
 	  IMX766 camera.
 
+config VIDEO_OV50H40
+	tristate "Sony OV50H40 sensor support"
+	depends on I2C && VIDEO_DEV
+	depends on MEDIA_CAMERA_SUPPORT
+	select MEDIA_CONTROLLER
+	select VIDEO_V4L2_SUBDEV_API
+	help
+	  This is a Video4Linux2 sensor driver for the Sony
+	  OV50H40 camera.
+
+config VIDEO_S5KJN5
+	tristate "Sony S5KJN5 sensor support"
+	depends on I2C && VIDEO_DEV
+	depends on MEDIA_CAMERA_SUPPORT
+	select MEDIA_CONTROLLER
+	select VIDEO_V4L2_SUBDEV_API
+	help
+	  This is a Video4Linux2 sensor driver for the Sony
+	  S5KJN5 camera.
+
 config VIDEO_JX_F37
 	tristate "Soi JX_F37 sensor support"
 	depends on I2C && VIDEO_DEV

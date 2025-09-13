@@ -659,6 +659,8 @@
 	// 	reg = <0x0c>;
 	// 	status = "okay";
 	// };
+
+
 	// cam3: imx858@29 {
 	// 	compatible = "sony,imx858";
 	// 	reg = <0x29>;
@@ -686,9 +688,83 @@
 	// 		};
 	// 	};
 	// };
-		cam3: imx766@1a {
-		compatible = "sony,imx766h";
-		reg = <0x1a>;
+		// vcm3: gt9764@c {
+	// 	compatible = "mediatek,gt9764";
+	// 	reg = <0x0c>;
+	// 	status = "okay";
+	// };
+
+
+	// 	cam3: imx766@1a {
+	// 	compatible = "sony,imx766h";
+	// 	reg = <0x1a>;
+	// 	clocks = <&cru CLK_MIPI_CAMARAOUT_M4>;
+	// 	clock-names = "xvclk";
+	// 	power-domains = <&power RK3588_PD_VI>;
+	// 	pinctrl-names = "default";
+	// 	pinctrl-0 = <&mipim0_camera4_clk>;
+	// 	// power-gpios = <&gpio1 RK_PB3 GPIO_ACTIVE_HIGH>;
+	// 	reset-gpios = <&gpio1 RK_PA6 GPIO_ACTIVE_HIGH>;
+	// 	//pwdn-gpios = <&gpio1 RK_PA0 GPIO_ACTIVE_HIGH>;
+	// 	rockchip,camera-module-index = <1>;
+	// 	rockchip,camera-module-facing = "back";
+	// 	rockchip,camera-module-name = "default";
+	// 	rockchip,camera-module-lens-name = "default";
+	// 	// rockchip,spd-id = <1>;  
+   	// 	// rockchip,ebd-id = <2>; 
+	// 	lens-focus = <&vcm3>;
+		
+	// 	port {
+	// 		imx989_out1: endpoint {
+	// 			remote-endpoint = <&mipi_in_ucam1>;
+	// 			bus-type = <1>;
+	// 			data-lanes = <1 2 3>;
+	// 		};
+	// 	};
+	// };
+
+	// vcm3: ak7375@74 {
+	// 	compatible = "asahi-kasei,ak7375";
+	// 	reg = <0x74>;
+	// 	status = "okay";
+	// };
+
+	// cam3: ov50h40@10 {
+	// 	compatible = "sony,ov50h40";
+	// 	reg = <0x10>;
+	// 	clocks = <&cru CLK_MIPI_CAMARAOUT_M4>;
+	// 	clock-names = "xvclk";
+	// 	power-domains = <&power RK3588_PD_VI>;
+	// 	pinctrl-names = "default";
+	// 	pinctrl-0 = <&mipim0_camera4_clk>;
+	// 	// power-gpios = <&gpio1 RK_PB3 GPIO_ACTIVE_HIGH>;
+	// 	reset-gpios = <&gpio1 RK_PA6 GPIO_ACTIVE_HIGH>;
+	// 	//pwdn-gpios = <&gpio1 RK_PA0 GPIO_ACTIVE_HIGH>;
+	// 	rockchip,camera-module-index = <1>;
+	// 	rockchip,camera-module-facing = "back";
+	// 	rockchip,camera-module-name = "default";
+	// 	rockchip,camera-module-lens-name = "default";
+	// 	// rockchip,spd-id = <1>;  
+   	// 	// rockchip,ebd-id = <2>; 
+	// 	lens-focus = <&vcm3>;
+		
+	// 	port {
+	// 		imx989_out1: endpoint {
+	// 			remote-endpoint = <&mipi_in_ucam1>;
+	// 			bus-type = <1>;
+	// 			data-lanes = <1 2 3>;
+	// 		};
+	// 	};
+	// };
+	// vcm3: ak7316@c {
+	// 	compatible = "asahi-kasei,ak7316";
+	// 	reg = <0x0c>;
+	// 	status = "okay";
+	// };
+
+	cam3: imx766@2d {
+		compatible = "samsung,s5kjn5";
+		reg = <0x2d>;
 		clocks = <&cru CLK_MIPI_CAMARAOUT_M4>;
 		clock-names = "xvclk";
 		power-domains = <&power RK3588_PD_VI>;
@@ -714,14 +790,9 @@
 		};
 	};
 
-	// vcm3: gt9764@c {
-	// 	compatible = "mediatek,gt9764";
-	// 	reg = <0x0c>;
-	// 	status = "okay";
-	// };
-	vcm3: ak7375@74 {
-		compatible = "asahi-kasei,ak7375";
-		reg = <0x74>;
+	vcm3: gt9764@c {
+		compatible = "mediatek,gt9764";
+		reg = <0x0c>;
 		status = "okay";
 	};
 };
