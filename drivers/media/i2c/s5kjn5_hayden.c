@@ -50,7 +50,7 @@
 
 #define S5KJN5_LANES			3
 
-#define S5KJN5_XVCLK_FREQ		19200000
+#define S5KJN5_XVCLK_FREQ		24000000
 
 #define CHIP_ID				0x38e5
 #define S5KJN5_REG_CHIP_ID_H		0x0000
@@ -4701,14 +4701,14 @@ static const struct regval s5kjn5_linear_10bit_4096x3072_60fps_pd_off[] = { //mo
 	{0x0350, 0x0008},
 	{0x0352, 0x0008},
 	{0x0340, 0x0C84},
-	{0x0342, 0x32B0},
+	{0x0342, 0x1790},
 	{0x0136, 0x1300},
 	{0x013E, 0x00C8},
 	{0x0304, 0x0002},
 	{0x0306, 0x00C0},
 	{0x030C, 0x0000},
 	{0x030E, 0x0003},
-	{0x0310, 0x00FA},
+	{0x0310, 0x015f},
 	{0x0312, 0x0002},
 	{0x031A, 0x0003},
 	{0x031C, 0x0032},
@@ -5373,7 +5373,7 @@ static const struct s5kjn5_mode supported_modes[] = {
 		.exp_def = 0x0a00,
 		.hts_def = 0x32B0,
 		.vts_def = 0x0C84,
-		.bus_fmt = MEDIA_BUS_FMT_SRGGB10_1X10,
+		.bus_fmt = MEDIA_BUS_FMT_SGRBG10_1X10,
 		.global_reg_list = s5kjn5_init_regs,
 		.reg_list = s5kjn5_linear_10bit_4096x3072_60fps_pd_off,
 		// .pixel_rate = ((u64)219600000*4*10)/8,
@@ -5394,7 +5394,7 @@ static const struct s5kjn5_mode supported_modes[] = {
 		.exp_def = 0x0f00,
 		.hts_def = 0x1d4c,//7500
 		.vts_def = 0x0f3e,//3902
-		.bus_fmt = MEDIA_BUS_FMT_SRGGB10_1X10,
+		.bus_fmt = MEDIA_BUS_FMT_SGRBG10_1X10,
 		.global_reg_list = s5kjn5_init_regs,
 		.reg_list = s5kjn5_linear_10bit_8192x6144_lowfps_pd_off,
 		.pixel_rate = ((u64)219600000*4*10)/8,
@@ -5952,12 +5952,12 @@ static long s5kjn5_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)//F
 						 1, h);
 
 			if (s5kjn5->cur_mode->bus_fmt ==
-			    MEDIA_BUS_FMT_SRGGB10_1X10) {
+			    MEDIA_BUS_FMT_SGRBG10_1X10) {
 				s5kjn5->cur_link_freq = 0;
 				s5kjn5->cur_pixel_rate =
 				s5kjn5->cur_mode->pixel_rate;
 			} else if (s5kjn5->cur_mode->bus_fmt ==
-				   MEDIA_BUS_FMT_SRGGB12_1X12) {
+				   MEDIA_BUS_FMT_SGRBG12_1X12) {
 				s5kjn5->cur_link_freq = 0;
 				s5kjn5->cur_pixel_rate =
 				s5kjn5->cur_mode->pixel_rate;
@@ -6564,10 +6564,10 @@ static int s5kjn5_initialize_controls(struct s5kjn5 *s5kjn5)//ok for 989
 				ARRAY_SIZE(link_freq_items) - 1, 0,
 				link_freq_items);
 
-	if (s5kjn5->cur_mode->bus_fmt == MEDIA_BUS_FMT_SRGGB10_1X10) {
+	if (s5kjn5->cur_mode->bus_fmt == MEDIA_BUS_FMT_SGRBG10_1X10) {
 		s5kjn5->cur_link_freq = 0;
 		s5kjn5->cur_pixel_rate = s5kjn5->cur_mode->pixel_rate;
-	} else if (s5kjn5->cur_mode->bus_fmt == MEDIA_BUS_FMT_SRGGB12_1X12) {
+	} else if (s5kjn5->cur_mode->bus_fmt == MEDIA_BUS_FMT_SGRBG12_1X12) {
 		s5kjn5->cur_link_freq = 0;
 		s5kjn5->cur_pixel_rate = s5kjn5->cur_mode->pixel_rate;
 	}
