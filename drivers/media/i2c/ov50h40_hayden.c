@@ -1453,10 +1453,12 @@ static const struct regval ov50h40_linear_10bit_4096x3072_60fps_pd_off[] = { //o
 	//ov50q
 	// {0x0302, 0x03},
 	{0x0303, 0x02},
+
 	{0x0304, 0x02},
-	{0x0305, 0x9A},
+	{0x0305, 0x40},
+
 	{0x0306, 0x03},
-	{0x0307, 0x02},
+	{0x0307, 0x01},
 	{0x0309, 0x02},
 	{0x0316, 0x3C},
 
@@ -1472,17 +1474,17 @@ static const struct regval ov50h40_linear_10bit_4096x3072_60fps_pd_off[] = { //o
 	{0x0360, 0x09},
 
 	//hts vts相关
-	{0x380c, 0x06},
-	{0x380d, 0x10},
+	{0x380c, 0x05},
+	{0x380d, 0x00},//ae is max
 
-	{0x380e, 0x0a},
-	{0x380f, 0xd8},
+	{0x380e, 0x03},
+	{0x380f, 0xb0},
 
-	{0x384c, 0x06},
-	{0x384d, 0x10},
+	{0x384c, 0x05},
+	{0x384d, 0x00},
 
-	{0x4546, 0x06},
-	{0x4547, 0x10},
+	{0x4546, 0x05},
+	{0x4547, 0x00},
 
 	// mipi 相关
 	{0x481B, 0x18},//important
@@ -1957,9 +1959,9 @@ static const struct ov50h40_mode supported_modes[] = {
 			.numerator = 10000,
 			.denominator = 600000,
 		},
-		.exp_def = 0x0f00,
-		.hts_def = 0x1d4c,//7500
-		.vts_def = 0x0f3e,//3902
+		.exp_def = 0x0010,
+		.hts_def = 1200,//7500
+		.vts_def = 3776,//3902
 		.bus_fmt = MEDIA_BUS_FMT_SRGGB10_1X10,
 		.global_reg_list = ov50h40_init_regs,
 		.reg_list = ov50h40_linear_10bit_4096x3072_60fps_pd_off,
