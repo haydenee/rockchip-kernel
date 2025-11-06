@@ -18,9 +18,9 @@
     pinctrl-0 = <&fusb302_int>;
 };
 
-&pcie2x1l0 {
-    disable-gpios = <&gpio6 0 GPIO_ACTIVE_HIGH>;
-};
+// &pcie2x1l0 {
+//     disable-gpios = <&gpio6 0 GPIO_ACTIVE_HIGH>;
+// };
 
 &pinctrl {
     usb-typec {

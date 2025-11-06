@@ -775,7 +775,7 @@ static const struct isp_clk_info rk3588_isp_clk_rate[] = {
 		.clk_rate = 600,
 		.refer_data = 3840,
 	}, {
-		.clk_rate = 702,
+		.clk_rate = 790,
 		.refer_data = 4672,
 	}
 };

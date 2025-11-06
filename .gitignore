@@ -175,3 +175,4 @@ sphinx_*/
 *.dtb*
 *.scr
 extboot*
+.version
