@@ -960,24 +960,7 @@
 	};
 };
 
-&i2c7 {
-	pinctrl-names = "default";
-	pinctrl-0 = <&i2c7m0_xfer>;
-	status = "okay";
 
-	es8388: es8388@10 {
-		status = "okay";
-		#sound-dai-cells = <0>;
-		compatible = "everest,es8388", "everest,es8323";
-		reg = <0x10>;
-		clocks = <&mclkout_i2s0>;
-		clock-names = "mclk";
-		assigned-clocks = <&mclkout_i2s0>;
-		assigned-clock-rates = <24576000>;
-		pinctrl-names = "default";
-		pinctrl-0 = <&i2s0_mclk>;
-	};
-};
 
 &i2s0_8ch {
 	status = "okay";
@@ -1673,40 +1656,60 @@
 	};
 
 
-	// cam1: ov50h40@10 {
-	// 	compatible = "sony,ov50h40";
-	// 	reg = <0x10>;
-	// 	clocks = <&cru CLK_MIPI_CAMARAOUT_M0>;
-	// 	clock-names = "xvclk";
-	// 	power-domains = <&power RK3588_PD_VI>;
-	// 	pinctrl-names = "default";
-	// 	pinctrl-0 = <&mipim0_camera2_clk>;
-	// 	// power-gpios = <&gpio1 RK_PB3 GPIO_ACTIVE_HIGH>;
-	// 	reset-gpios = <&gpio1 RK_PC4 GPIO_ACTIVE_HIGH>;
-	// 	//pwdn-gpios = <&gpio1 RK_PA0 GPIO_ACTIVE_HIGH>;
-	// 	rockchip,camera-module-index = <1>;
-	// 	rockchip,camera-module-facing = "back";
-	// 	rockchip,camera-module-name = "default";
-	// 	rockchip,camera-module-lens-name = "default";
-	// 	// rockchip,spd-id = <1>;  
-   	// 	// rockchip,ebd-id = <2>; 
-	// 	lens-focus = <&vcm1>;
-		
-	// 	port {
-	// 		imx989_out1: endpoint {
-	// 			remote-endpoint = <&mipi_in_ucam1>;
-	// 			bus-type = <1>;
-	// 			data-lanes = <1 2 3>;
-	// 		};
-	// 	};
-	// };
-	// vcm1: ak7316@c {
-	// 	compatible = "asahi-kasei,ak7316";
-	// 	reg = <0x0c>;
-	// 	status = "okay";
-	// };
+
 };
 
+&i2c7 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c7m0_xfer>;
+	status = "okay";
+
+	es8388: es8388@11 {
+		status = "okay";
+		#sound-dai-cells = <0>;
+		compatible = "everest,es8388", "everest,es8323";
+		reg = <0x11>;
+		clocks = <&mclkout_i2s0>;
+		clock-names = "mclk";
+		assigned-clocks = <&mclkout_i2s0>;
+		assigned-clock-rates = <24576000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&i2s0_mclk>;
+	};
+
+	cam1: ov50h40@10 {
+		compatible = "sony,ov50h40";
+		reg = <0x10>;
+		clocks = <&cru CLK_MIPI_CAMARAOUT_M0>;
+		clock-names = "xvclk";
+		power-domains = <&power RK3588_PD_VI>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&mipim0_camera2_clk>;
+		// power-gpios = <&gpio1 RK_PB3 GPIO_ACTIVE_HIGH>;
+		reset-gpios = <&gpio1 RK_PC4 GPIO_ACTIVE_HIGH>;
+		//pwdn-gpios = <&gpio1 RK_PA0 GPIO_ACTIVE_HIGH>;
+		rockchip,camera-module-index = <1>;
+		rockchip,camera-module-facing = "back";
+		rockchip,camera-module-name = "default";
+		rockchip,camera-module-lens-name = "default";
+		// rockchip,spd-id = <1>;  
+   		// rockchip,ebd-id = <2>; 
+		lens-focus = <&vcm1>;
+		
+		port {
+			imx989_out1: endpoint {
+				remote-endpoint = <&mipi_in_ucam1>;
+				bus-type = <1>;
+				data-lanes = <1 2 3>;
+			};
+		};
+	};
+	vcm1: ak7316@c {
+		compatible = "asahi-kasei,ak7316";
+		reg = <0x0c>;
+		status = "okay";
+	};
+};
 &mipi_dcphy0 {
 	status = "okay";
 };
@@ -1835,100 +1838,100 @@
 	};
 };
 
-// &csi2_dcphy1 {
-// 	status = "okay";
+&csi2_dcphy1 {
+	status = "okay";
 
-// 	ports {
-// 		#address-cells = <1>;
-// 		#size-cells = <0>;
-// 		port@0 {
-// 			reg = <0>;
-// 			#address-cells = <1>;
-// 			#size-cells = <0>;
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
 
-// 			mipi_in_ucam1: endpoint@0 {
-// 				reg = <0>;
-// 				remote-endpoint = <&imx989_out1>;
-// 				bus-type = <1>;
-// 				data-lanes = <1 2 3>;
-// 			};
-// 		};
-// 		port@1 {
-// 			reg = <1>;
-// 			#address-cells = <1>;
-// 			#size-cells = <0>;
+			mipi_in_ucam1: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&imx989_out1>;
+				bus-type = <1>;
+				data-lanes = <1 2 3>;
+			};
+		};
+		port@1 {
+			reg = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
 
-// 			csidcphy1_out: endpoint@0 {
-// 				reg = <0>;
-// 				remote-endpoint = <&mipi1_csi2_input>;
-// 			};
-// 		};
-// 	};
-// };
+			csidcphy1_out: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&mipi1_csi2_input>;
+			};
+		};
+	};
+};
 
 
 
-// &mipi1_csi2 {
-// 	status = "okay";
+&mipi1_csi2 {
+	status = "okay";
 
-// 	ports {
-// 		#address-cells = <1>;
-// 		#size-cells = <0>;
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
 
-// 		port@0 {
-// 			reg = <0>;
-// 			#address-cells = <1>;
-// 			#size-cells = <0>;
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
 
-// 			mipi1_csi2_input: endpoint@0 {
-// 				reg = <0>;
-// 				remote-endpoint = <&csidcphy1_out>;
-// 			};
-// 		};
+			mipi1_csi2_input: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&csidcphy1_out>;
+			};
+		};
 
-// 		port@1 {
-// 			reg = <1>;
-// 			#address-cells = <1>;
-// 			#size-cells = <0>;
+		port@1 {
+			reg = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
 
-// 			mipi1_csi2_output: endpoint@0 {
-// 				reg = <0>;
-// 				remote-endpoint = <&cif_mipi_in1>;
-// 			};
-// 		};
-// 	};
-// };
+			mipi1_csi2_output: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&cif_mipi_in1>;
+			};
+		};
+	};
+};
 
-// &rkcif_mipi_lvds1 {
-// 	status = "okay";
+&rkcif_mipi_lvds1 {
+	status = "okay";
 
-// 	port {
-// 		cif_mipi_in1: endpoint {
-// 			remote-endpoint = <&mipi1_csi2_output>;
-// 		};
-// 	};
-// };
+	port {
+		cif_mipi_in1: endpoint {
+			remote-endpoint = <&mipi1_csi2_output>;
+		};
+	};
+};
 
-// &rkcif_mipi_lvds1_sditf {
-// 	status = "okay";
+&rkcif_mipi_lvds1_sditf {
+	status = "okay";
 
-// 	port {
-// 		mipi_lvds1_sditf: endpoint {
-// 			remote-endpoint = <&isp1_vir0>;
-// 		};
-// 	};
-// };
+	port {
+		mipi_lvds1_sditf: endpoint {
+			remote-endpoint = <&isp1_vir0>;
+		};
+	};
+};
 
-// &rkisp1_vir0 {
-// 	status = "okay";
+&rkisp1_vir0 {
+	status = "okay";
 
-// 	port {
-// 		#address-cells = <1>;
-// 		#size-cells = <0>;
+	port {
+		#address-cells = <1>;
+		#size-cells = <0>;
 
-// 		isp1_vir0: endpoint@0 {
-// 			reg = <0>;
-// 			remote-endpoint = <&mipi_lvds1_sditf>;
-// 		};
-// 	};
-// };
+		isp1_vir0: endpoint@0 {
+			reg = <0>;
+			remote-endpoint = <&mipi_lvds1_sditf>;
+		};
+	};
+};
