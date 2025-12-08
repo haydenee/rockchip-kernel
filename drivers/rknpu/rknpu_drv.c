@@ -1250,6 +1250,8 @@ static int rknpu_probe(struct platform_device *pdev)
 	const struct rknpu_config *config = NULL;
 	int ret = -EINVAL, i = 0;
 
+	LOG_DEV_ERROR(dev, "HAYDEN rknpu probe start\n");
+
 	if (!pdev->dev.of_node) {
 		LOG_DEV_ERROR(dev, "rknpu device-tree data is missing!\n");
 		return -ENODEV;

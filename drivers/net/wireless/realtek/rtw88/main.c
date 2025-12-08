@@ -1969,9 +1969,16 @@ static int rtw_chip_parameter_setup(struct rtw_dev *rtwdev)
 		return -EINVAL;
 	}
 
-	hal->chip_version = rtw_read32(rtwdev, REG_SYS_CFG1);
-	hal->cut_version = BIT_GET_CHIP_VER(hal->chip_version);
-	hal->mp_chip = (hal->chip_version & BIT_RTL_ID) ? 0 : 1;
+	// hal->chip_version = rtw_read32(rtwdev, REG_SYS_CFG1);
+	for (int i = 0; i < 20; i++) {
+		hal->chip_version = i == 19 ? 0x493d30ea : rtw_read32(rtwdev, REG_SYS_CFG1);
+		hal->cut_version = BIT_GET_CHIP_VER(hal->chip_version);
+		hal->mp_chip = (hal->chip_version & BIT_RTL_ID) ? 0 : 1;
+		printk("[HAYDEN] rtw88: %s:%d hal->chip_version=0x%x\n",
+			__func__, __LINE__, hal->chip_version);
+		mdelay(100);
+	}
+
 	if (hal->chip_version & BIT_RF_TYPE_ID) {
 		hal->rf_type = RF_2T2R;
 		hal->rf_path_num = 2;

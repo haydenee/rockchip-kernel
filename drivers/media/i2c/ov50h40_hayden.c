@@ -50,7 +50,7 @@
 
 #define OV50H40_LANES			3
 
-#define OV50H40_XVCLK_FREQ		19200000
+#define OV50H40_XVCLK_FREQ		24000000
 
 #define CHIP_ID				0x5650
 #define CHIP_ID2			0x0859
@@ -201,6 +201,10 @@ struct ov50h40 {
 	struct regval *batch_regs;     // 存储 batch 设置的寄存器
     u32 batch_reg_count;           // batch 寄存器数量
     bool apply_batch_on_stream;    // 是否在开流时应用 batch 寄存器
+
+	/* Clock role and handling */
+	enum { CLOCK_ROLE_MASTER = 0, CLOCK_ROLE_SLAVE = 1 } clock_role;
+	bool xvclk_always_on;
 };
 
 #define to_ov50h40(sd) container_of(sd, struct ov50h40, subdev)
@@ -1426,7 +1430,7 @@ static const struct regval ov50h40_linear_10bit_4096x3072_60fps_pd_off[] = { //o
 	// {0x0307, 0x00},
 	// {0x0308, 0x03},
 
-	{0x0323, 0x12},
+	{0x0323, 0x13},
 	{0x0324, 0x02},
 	{0x0325, 0x58},
 	{0x0327, 0x0e},
@@ -1437,7 +1441,7 @@ static const struct regval ov50h40_linear_10bit_4096x3072_60fps_pd_off[] = { //o
 	{0x032c, 0x00},
 	{0x032e, 0x01},
 
-	{0x0343, 0x02},
+	{0x0343, 0x03},
 	{0x0344, 0x01},
 	{0x0345, 0x20},
 	{0x0346, 0xdf},
@@ -1452,10 +1456,10 @@ static const struct regval ov50h40_linear_10bit_4096x3072_60fps_pd_off[] = { //o
 
 	//ov50q
 	// {0x0302, 0x03},
-	{0x0303, 0x02},
+	{0x0303, 0x03},
 
 	{0x0304, 0x02},
-	{0x0305, 0x40},
+	{0x0305, 0x44},
 
 	{0x0306, 0x03},
 	{0x0307, 0x01},
@@ -2834,24 +2838,7 @@ static int __ov50h40_power_on(struct ov50h40 *ov50h40)//ok for all
 	u32 delay_us;
 	struct device *dev = &ov50h40->client->dev;
 
-	if(!ov50h40->xvclk) {
-		dev_err(dev, "xvclk is not ready, skip xvclk. you will have to provide clock yourself\n");
-	}
-	else
-	{
-		ret = clk_set_rate(ov50h40->xvclk, OV50H40_XVCLK_FREQ);
-		if (ret < 0) {
-			dev_err(dev, "Failed to set xvclk rate (24MHz)\n");
-			return ret;
-		}
-		if (clk_get_rate(ov50h40->xvclk) != OV50H40_XVCLK_FREQ)
-			dev_warn(dev, "xvclk mismatched, modes are based on 24MHz\n");
-		ret = clk_prepare_enable(ov50h40->xvclk);
-		if (ret < 0) {
-			dev_err(dev, "Failed to enable xvclk\n");
-			return ret;
-		}
-	}
+	/* Do not touch xvclk here; it's managed during probe based on clock-role */
 
 	if (!IS_ERR(ov50h40->reset_gpio))
 		gpiod_set_value_cansleep(ov50h40->reset_gpio, 0);
@@ -2878,17 +2865,15 @@ static int __ov50h40_power_on(struct ov50h40 *ov50h40)//ok for all
 	return 0;
 
 disable_clk:
-    if (!IS_ERR(ov50h40->xvclk))
-	{
-        clk_disable_unprepare(ov50h40->xvclk);
-	}
+	/* Keep xvclk running; skip disable here */
 
 	return ret;
 }
 
 static void __ov50h40_power_off(struct ov50h40 *ov50h40)//ok for all
 {
-
+	//for debug
+	return;
 	if (!IS_ERR(ov50h40->pwdn_gpio))
 		gpiod_set_value_cansleep(ov50h40->pwdn_gpio, 0);
 	clk_disable_unprepare(ov50h40->xvclk);
@@ -3844,15 +3829,69 @@ static int ov50h40_probe(struct i2c_client *client,
 
 	ov50h40->batch_regs = NULL;
     ov50h40->batch_reg_count = 0;
-    ov50h40->apply_batch_on_stream = true;
+	ov50h40->apply_batch_on_stream = true;
+	ov50h40->clock_role = CLOCK_ROLE_MASTER; /* default */
+	ov50h40->xvclk_always_on = false;
 
 	if (i == ov50h40->cfg_num)
+	{
 		ov50h40->cur_mode = &supported_modes[0];
+	}
 
-	ov50h40->xvclk = devm_clk_get(dev, "xvclk");
-	if (IS_ERR(ov50h40->xvclk)) {
-		dev_err(dev, "Failed to get xvclk\n");
-		// return -EINVAL;
+	/* Parse clock-role and set up xvclk accordingly */
+	{
+		const char *clk_role = NULL;
+		if (!of_property_read_string(node, "clock-role", &clk_role)) {
+			if (clk_role && !strcmp(clk_role, "slave"))
+				ov50h40->clock_role = CLOCK_ROLE_SLAVE;
+			else if (clk_role && !strcmp(clk_role, "master"))
+				ov50h40->clock_role = CLOCK_ROLE_MASTER;
+			else
+				dev_warn(dev, "unknown clock-role '%s', defaulting to master\n", clk_role);
+		}
+		dev_info(dev, "clock-role: %s\n", ov50h40->clock_role == CLOCK_ROLE_MASTER ? "master" : "slave");
+	}
+
+	if (ov50h40->clock_role == CLOCK_ROLE_MASTER) {
+		ov50h40->xvclk = devm_clk_get(dev, "xvclk");
+		if (IS_ERR(ov50h40->xvclk)) {
+			int err = PTR_ERR(ov50h40->xvclk);
+			dev_err(dev, "Failed to get xvclk for master: %d\n", err);
+			return err ? err : -EINVAL;
+		}
+		ret = clk_set_rate(ov50h40->xvclk, OV50H40_XVCLK_FREQ);
+		if (ret < 0) {
+			dev_err(dev, "Failed to set xvclk rate (24MHz)\n");
+			return ret;
+		}
+		if (clk_get_rate(ov50h40->xvclk) != OV50H40_XVCLK_FREQ)
+			dev_warn(dev, "xvclk mismatched, modes are based on 24MHz\n");
+		ret = clk_prepare_enable(ov50h40->xvclk);
+		if (ret < 0) {
+			dev_err(dev, "Failed to enable xvclk\n");
+			return ret;
+		}
+		ov50h40->xvclk_always_on = true;
+	} else {
+		ov50h40->xvclk = devm_clk_get_optional(dev, "xvclk");
+		if (IS_ERR(ov50h40->xvclk)) {
+			int err = PTR_ERR(ov50h40->xvclk);
+			if (err == -EPROBE_DEFER) {
+				dev_info(dev, "xvclk not ready for slave, deferring probe\n");
+				return -EPROBE_DEFER;
+			}
+			dev_warn(dev, "optional xvclk not available for slave (%d), deferring\n", err);
+			return -EPROBE_DEFER;
+		}
+		if (!ov50h40->xvclk) {
+			dev_info(dev, "no xvclk handle for slave, deferring until provider ready\n");
+			return -EPROBE_DEFER;
+		}
+		if (clk_get_rate(ov50h40->xvclk) != OV50H40_XVCLK_FREQ) {
+			dev_info(dev, "slave xvclk rate not set to 24MHz yet (%lu Hz), deferring\n",
+					 clk_get_rate(ov50h40->xvclk));
+			return -EPROBE_DEFER;
+		}
 	}
 
 	ov50h40->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_LOW);

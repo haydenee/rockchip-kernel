@@ -201,6 +201,10 @@ struct imx766 {
 	struct regval *batch_regs;     // 存储 batch 设置的寄存器
     u32 batch_reg_count;           // batch 寄存器数量
     bool apply_batch_on_stream;    // 是否在开流时应用 batch 寄存器
+
+	/* Clock role and handling */
+	enum { CLOCK_ROLE_MASTER = 0, CLOCK_ROLE_SLAVE = 1 } clock_role;
+	bool xvclk_always_on;
 };
 
 #define to_imx766(sd) container_of(sd, struct imx766, subdev)
@@ -2128,24 +2132,7 @@ static int __imx766_power_on(struct imx766 *imx766)//ok for all
             dev_warn(dev, "pinctrl default select failed: %d\n", ret);
     }
 
-	if(!imx766->xvclk) {
-		dev_err(dev, "xvclk is not ready, skip xvclk. you will have to provide clock yourself\n");
-	}
-	else
-	{
-		ret = clk_set_rate(imx766->xvclk, IMX766_XVCLK_FREQ);
-		if (ret < 0) {
-			dev_err(dev, "Failed to set xvclk rate (24MHz)\n");
-			return ret;
-		}
-		if (clk_get_rate(imx766->xvclk) != IMX766_XVCLK_FREQ)
-			dev_warn(dev, "xvclk mismatched, modes are based on 24MHz\n");
-		ret = clk_prepare_enable(imx766->xvclk);
-		if (ret < 0) {
-			dev_err(dev, "Failed to enable xvclk\n");
-			return ret;
-		}
-	}
+	/* Do not toggle xvclk here. Managed in probe based on clock-role. */
 
 	if (!IS_ERR(imx766->reset_gpio))
 		gpiod_set_value_cansleep(imx766->reset_gpio, 0);
@@ -2175,11 +2162,7 @@ static int __imx766_power_on(struct imx766 *imx766)//ok for all
 	return 0;
 
 disable_clk:
-    if (!IS_ERR(imx766->xvclk))
-	{
-		dev_info(dev, "%s: disable xvclk due to failure\n", __func__);
-        // clk_disable_unprepare(imx766->xvclk);
-	}
+    /* Do not disable xvclk here to keep it stable */
 
 	return ret;
 }
@@ -3146,15 +3129,69 @@ static int imx766_probe(struct i2c_client *client,
 	imx766->batch_regs = NULL;
     imx766->batch_reg_count = 0;
     imx766->apply_batch_on_stream = true;
+	imx766->clock_role = CLOCK_ROLE_MASTER; /* default */
+	imx766->xvclk_always_on = false;
 
 	if (i == imx766->cfg_num)
+	{
 		imx766->cur_mode = &supported_modes[0];
-
-	imx766->xvclk = devm_clk_get(dev, "xvclk");
-	if (IS_ERR(imx766->xvclk)) {
-		dev_err(dev, "Failed to get xvclk\n");
-		// return -EINVAL;
 	}
+
+		/* Parse clock-role and set up xvclk accordingly */
+		{
+			const char *clk_role = NULL;
+			if (!of_property_read_string(node, "clock-role", &clk_role)) {
+				if (clk_role && !strcmp(clk_role, "slave"))
+					imx766->clock_role = CLOCK_ROLE_SLAVE;
+				else if (clk_role && !strcmp(clk_role, "master"))
+					imx766->clock_role = CLOCK_ROLE_MASTER;
+				else
+					dev_warn(dev, "unknown clock-role '%s', defaulting to master\n", clk_role);
+			}
+			dev_info(dev, "clock-role: %s\n", imx766->clock_role == CLOCK_ROLE_MASTER ? "master" : "slave");
+		}
+
+		if (imx766->clock_role == CLOCK_ROLE_MASTER) {
+			imx766->xvclk = devm_clk_get(dev, "xvclk");
+			if (IS_ERR(imx766->xvclk)) {
+				int err = PTR_ERR(imx766->xvclk);
+				dev_err(dev, "Failed to get xvclk for master: %d\n", err);
+				return err ? err : -EINVAL;
+			}
+			ret = clk_set_rate(imx766->xvclk, IMX766_XVCLK_FREQ);
+			if (ret < 0) {
+				dev_err(dev, "Failed to set xvclk rate (24MHz)\n");
+				return ret;
+			}
+			if (clk_get_rate(imx766->xvclk) != IMX766_XVCLK_FREQ)
+				dev_warn(dev, "xvclk mismatched, modes are based on 24MHz\n");
+			ret = clk_prepare_enable(imx766->xvclk);
+			if (ret < 0) {
+				dev_err(dev, "Failed to enable xvclk\n");
+				return ret;
+			}
+			imx766->xvclk_always_on = true;
+		} else {
+			imx766->xvclk = devm_clk_get_optional(dev, "xvclk");
+			if (IS_ERR(imx766->xvclk)) {
+				int err = PTR_ERR(imx766->xvclk);
+				if (err == -EPROBE_DEFER) {
+					dev_info(dev, "xvclk not ready for slave, deferring probe\n");
+					return -EPROBE_DEFER;
+				}
+				dev_warn(dev, "optional xvclk not available for slave (%d), deferring\n", err);
+				return -EPROBE_DEFER;
+			}
+			if (!imx766->xvclk) {
+				dev_info(dev, "no xvclk handle for slave, deferring until provider ready\n");
+				return -EPROBE_DEFER;
+			}
+			if (clk_get_rate(imx766->xvclk) != IMX766_XVCLK_FREQ) {
+				dev_info(dev, "slave xvclk rate not set to 24MHz yet (%lu Hz), deferring\n",
+						 clk_get_rate(imx766->xvclk));
+				return -EPROBE_DEFER;
+			}
+		}
 	
 	imx766->pinctrl = devm_pinctrl_get(dev);
     if (IS_ERR(imx766->pinctrl)) {
