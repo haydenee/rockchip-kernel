@@ -17,3 +17,17 @@ config PCIE_FUNC_RKEP_USERPAGES
 	help
 	  Enable this configuration option to reserve continuous physical space
           for user layer in Rockchip's EP demo function driver.
+
+config ROCKCHIP_LTC_SPI
+	tristate "Rockchip SPI MOSI LTC generator"
+	depends on ARCH_ROCKCHIP || COMPILE_TEST
+	depends on OF && HAS_IOMEM && DMA_ENGINE
+	depends on COMMON_CLK
+	help
+	  Dedicated LTC timecode generator for Rockchip SPI controllers.
+	  The driver owns the SPI controller directly and streams one-bit
+	  samples on MOSI using TX DMA. On RK3588 LubanCat-5 this is intended
+	  for SPI0_MOSI_M2 / GPIO1_B2 and exposes /dev/ltc0.
+
+	  To build it as a module, choose M here. The module will be called
+	  rockchip-ltc-spi.

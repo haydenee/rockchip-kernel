@@ -392,9 +392,11 @@
 };
 
 &uart4 {
-	status = "okay";
-	pinctrl-names = "default";
-	pinctrl-0 = <&uart4m2_xfer>;
+	/*
+	 * uart4m2_rx uses GPIO1_B2, which is reserved for SPI0_MOSI_M2 LTC
+	 * output on this board configuration.
+	 */
+	status = "disabled";
 };
 
 &uart7 {
@@ -624,6 +626,16 @@
 
 
 	
+
+&spi0 {
+	compatible = "rockchip,rk3588-ltc-spi";
+	status = "okay";
+	assigned-clocks = <&cru CLK_SPI0>;
+	assigned-clock-rates = <198000000>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&spi0_ltc_mosi_m2>;
+	rockchip,ltc-sample-rate = <792000>;
+};
 
 &spi2 {
 	status = "okay";
@@ -1660,6 +1672,14 @@
 	leds {
 		sys_led_pin: sys-led-pin {
 			rockchip,pins = <0 RK_PD3 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+
+	ltc-spi0 {
+		spi0_ltc_mosi_m2: spi0-ltc-mosi-m2 {
+			rockchip,pins =
+				/* spi0_mosi_m2 */
+				<1 RK_PB2 8 &pcfg_pull_none_drv_level_6>;
 		};
 	};
 
