@@ -16,11 +16,33 @@ enum rk_ltc_mode {
 	RK_LTC_MODE_RAW_FRAME = 5,
 };
 
+enum rk_ltc_sync_source {
+	RK_LTC_SYNC_SOURCE_NONE = 0,
+	RK_LTC_SYNC_SOURCE_REALTIME = 1,
+	RK_LTC_SYNC_SOURCE_TAI = 2,
+	RK_LTC_SYNC_SOURCE_MONOTONIC = 3,
+	/*
+	 * PTP_TAI uses CLOCK_TAI when ptp_index is -1. When ptp_index is
+	 * non-negative, it reads /dev/ptp<ptp_index> directly and treats that
+	 * PHC as a TAI/PTP-domain clock.
+	 */
+	RK_LTC_SYNC_SOURCE_PTP_TAI = 4,
+};
+
+enum rk_ltc_sync_state {
+	RK_LTC_SYNC_STATE_OFF = 0,
+	RK_LTC_SYNC_STATE_LOCKED = 1,
+	RK_LTC_SYNC_STATE_SLEWING = 2,
+	RK_LTC_SYNC_STATE_HOLD = 3,
+};
+
 #define RK_LTC_FLAG_DROP_FRAME		(1U << 0)
 #define RK_LTC_FLAG_COLOR_FRAME		(1U << 1)
 #define RK_LTC_FLAG_BGF0		(1U << 2)
 #define RK_LTC_FLAG_BGF1		(1U << 3)
 #define RK_LTC_FLAG_BGF2		(1U << 4)
+
+#define RK_LTC_SYNC_FLAG_JAM_ON_START	(1U << 0)
 
 struct rk_ltc_timecode {
 	__u8 hours;
@@ -45,6 +67,23 @@ struct rk_ltc_config {
 	__u32 reserved[12];
 };
 
+struct rk_ltc_sync_config {
+	__u32 source;
+	__u32 flags;
+	__s32 max_slew_ppm;
+	__s32 lock_threshold_ms;
+	__s64 offset_ns;
+	__s32 ptp_index;
+	/* 0 disables codeword-boundary jump lock for large running errors. */
+	__s32 jump_threshold_ms;
+	/* Proportional gain: ppb correction per millisecond of phase error. */
+	__s32 pll_kp_ppb_per_ms;
+	/* Integral gain: ppb/s per millisecond of sustained phase error. */
+	__s32 pll_ki_ppb_per_ms_s;
+	__s32 pll_deadband_us;
+	__u32 reserved[7];
+};
+
 struct rk_ltc_status {
 	__u32 running;
 	__u32 mode;
@@ -64,7 +103,20 @@ struct rk_ltc_status {
 	__u64 irq_count;
 	__u64 decoder_locks;
 	__u64 decoder_errors;
-	__u32 reserved[16];
+	__u32 sync_source;
+	__u32 sync_state;
+	__s32 sync_correction_ppm;
+	__s32 sync_max_slew_ppm;
+	__s64 sync_phase_error_ns;
+	__u64 sync_updates;
+	__u64 sync_locked_updates;
+	__s64 sync_offset_ns;
+	__s32 sync_ptp_index;
+	__s32 sync_correction_ppb;
+	__s32 sync_integral_ppb;
+	__u64 sync_jump_count;
+	__s64 sync_last_jump_error_ns;
+	__u32 reserved[1];
 };
 
 #define RK_LTC_IOC_MAGIC		'L'
@@ -75,5 +127,7 @@ struct rk_ltc_status {
 #define RK_LTC_IOC_SET_TIMECODE		_IOW(RK_LTC_IOC_MAGIC, 0x04, struct rk_ltc_timecode)
 #define RK_LTC_IOC_GET_TIMECODE		_IOR(RK_LTC_IOC_MAGIC, 0x05, struct rk_ltc_timecode)
 #define RK_LTC_IOC_GET_STATUS		_IOR(RK_LTC_IOC_MAGIC, 0x06, struct rk_ltc_status)
+#define RK_LTC_IOC_SET_SYNC		_IOW(RK_LTC_IOC_MAGIC, 0x07, struct rk_ltc_sync_config)
+#define RK_LTC_IOC_GET_SYNC		_IOR(RK_LTC_IOC_MAGIC, 0x08, struct rk_ltc_sync_config)
 
 #endif /* _UAPI_LINUX_RK_LTC_H */

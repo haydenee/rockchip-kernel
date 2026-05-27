@@ -406,6 +406,57 @@ int ptp_clock_index(struct ptp_clock *ptp)
 }
 EXPORT_SYMBOL(ptp_clock_index);
 
+int ptp_clock_gettime_by_index(int index, struct timespec64 *ts)
+{
+	char name[PTP_CLOCK_NAME_LEN];
+	struct ptp_clock_info *ops;
+	struct ptp_clock *ptp;
+	struct device *dev;
+	int ret;
+
+	if (index < 0 || !ts)
+		return -EINVAL;
+	if (!ptp_class)
+		return -ENODEV;
+
+	snprintf(name, sizeof(name), "ptp%d", index);
+	dev = class_find_device_by_name(ptp_class, name);
+	if (!dev)
+		return -ENODEV;
+
+	ptp = dev_get_drvdata(dev);
+	if (!ptp || READ_ONCE(ptp->defunct)) {
+		ret = -ENODEV;
+		goto out_put_device;
+	}
+
+	ops = ptp->info;
+	if (!ops || (!ops->gettimex64 && !ops->gettime64)) {
+		ret = -EOPNOTSUPP;
+		goto out_put_device;
+	}
+
+	if (ops->owner && !try_module_get(ops->owner)) {
+		ret = -ENODEV;
+		goto out_put_device;
+	}
+
+	if (READ_ONCE(ptp->defunct))
+		ret = -ENODEV;
+	else if (ops->gettimex64)
+		ret = ops->gettimex64(ops, ts, NULL);
+	else
+		ret = ops->gettime64(ops, ts);
+
+	if (ops->owner)
+		module_put(ops->owner);
+
+out_put_device:
+	put_device(dev);
+	return ret;
+}
+EXPORT_SYMBOL(ptp_clock_gettime_by_index);
+
 int ptp_find_pin(struct ptp_clock *ptp,
 		 enum ptp_pin_function func, unsigned int chan)
 {

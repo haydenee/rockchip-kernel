@@ -22,9 +22,11 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/ptp_clock_kernel.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/timekeeping.h>
 #include <linux/uaccess.h>
 #include <uapi/linux/rk_ltc.h>
 
@@ -33,6 +35,17 @@
 #define RK_LTC_RING_BYTES			(64 * 1024)
 #define RK_LTC_PERIOD_BYTES			4096
 #define RK_LTC_DEFAULT_SPI_PARENT_HZ		198000000U
+#define RK_LTC_PHASE_SHIFT			16
+#define RK_LTC_PHASE_ONE			(1ULL << RK_LTC_PHASE_SHIFT)
+#define RK_LTC_DEFAULT_MAX_SLEW_PPM		1000
+#define RK_LTC_MAX_SLEW_PPM			100000
+#define RK_LTC_DEFAULT_LOCK_THRESHOLD_MS	5
+#define RK_LTC_DEFAULT_PLL_KP_PPB_PER_MS	10000
+#define RK_LTC_DEFAULT_PLL_KI_PPB_PER_MS_S	2000
+#define RK_LTC_MAX_PLL_GAIN			1000000
+#define RK_LTC_PLL_ERROR_CLAMP_NS		(10LL * NSEC_PER_SEC)
+#define RK_LTC_NSEC_PER_MSEC			1000000LL
+#define RK_LTC_NSEC_PER_USEC			1000LL
 
 /* Rockchip SPI register offsets */
 #define ROCKCHIP_SPI_CTRLR0			0x0000
@@ -136,6 +149,11 @@ struct rk_ltc {
 	struct rk_ltc_timecode current_tc;
 	struct rk_ltc_timecode *period_tc;
 	struct rk_ltc_gen gen;
+	struct rk_ltc_sync_config sync_cfg;
+	u32 sync_state;
+	s32 sync_correction_ppb;
+	s32 sync_integral_ppb;
+	s64 sync_phase_error_ns;
 
 	u64 codewords_generated;
 	u64 samples_generated;
@@ -144,6 +162,10 @@ struct rk_ltc {
 	u64 irq_count;
 	u64 decoder_locks;
 	u64 decoder_errors;
+	u64 sync_updates;
+	u64 sync_locked_updates;
+	u64 sync_jump_count;
+	s64 sync_last_jump_error_ns;
 };
 
 static const u8 rk_ltc_sync_bits[16] = {
@@ -266,6 +288,468 @@ static void rk_ltc_increment_time(struct rk_ltc_timecode *tc,
 		tc->frames = 2;
 }
 
+static u64 rk_ltc_frames_per_day(const struct rk_ltc_rate *rate, bool drop)
+{
+	if (drop)
+		return 24ULL * 60 * 60 * 30 - 2ULL * (24 * 60 - 24 * 6);
+
+	return 24ULL * 60 * 60 * rate->addr_fps;
+}
+
+static u64 rk_ltc_tc_to_linear(const struct rk_ltc_timecode *tc,
+			       const struct rk_ltc_rate *rate, bool drop)
+{
+	u64 minutes, frames;
+
+	frames = ((u64)tc->hours * 3600 + (u64)tc->minutes * 60 +
+		  tc->seconds) * rate->addr_fps + tc->frames;
+	if (!drop)
+		return frames;
+
+	minutes = (u64)tc->hours * 60 + tc->minutes;
+
+	return frames - 2 * (minutes - minutes / 10);
+}
+
+static void rk_ltc_linear_to_tc(u64 frame, const struct rk_ltc_rate *rate,
+				bool drop, struct rk_ltc_timecode *tc)
+{
+	u64 label, ten_min, rem, dropped;
+
+	frame %= rk_ltc_frames_per_day(rate, drop);
+	if (drop) {
+		ten_min = div64_u64_rem(frame, 17982, &rem);
+		dropped = 18 * ten_min;
+		if (rem >= 2)
+			dropped += 2 * div64_u64(rem - 2, 1798);
+		label = frame + dropped;
+	} else {
+		label = frame;
+	}
+
+	tc->frames = do_div(label, rate->addr_fps);
+	tc->seconds = do_div(label, 60);
+	tc->minutes = do_div(label, 60);
+	tc->hours = label % 24;
+	memset(tc->reserved, 0, sizeof(tc->reserved));
+}
+
+static s64 rk_ltc_mod_day_ns(s64 ns)
+{
+	const s64 day_ns = 24LL * 60 * 60 * NSEC_PER_SEC;
+
+	ns = div64_s64(ns, day_ns) ? ns % day_ns : ns;
+	if (ns < 0)
+		ns += day_ns;
+
+	return ns;
+}
+
+static u64 rk_ltc_pipeline_latency_ns(const struct rk_ltc *ltc)
+{
+	u64 samples;
+	u32 rate = ltc->actual_sample_rate ? ltc->actual_sample_rate :
+		   ltc->sample_rate;
+
+	if (!rate || !ltc->periods)
+		return 0;
+
+	samples = (u64)(ltc->periods - 1) * ltc->period_bytes * 8;
+
+	return div64_u64(samples * NSEC_PER_SEC, rate);
+}
+
+static int rk_ltc_read_sync_time(const struct rk_ltc_sync_config *cfg,
+				 s64 *ns)
+{
+	struct timespec64 ts;
+	int ret;
+
+	switch (cfg->source) {
+	case RK_LTC_SYNC_SOURCE_REALTIME:
+		ktime_get_real_ts64(&ts);
+		break;
+	case RK_LTC_SYNC_SOURCE_TAI:
+		ktime_get_clocktai_ts64(&ts);
+		break;
+	case RK_LTC_SYNC_SOURCE_PTP_TAI:
+		if (cfg->ptp_index < 0) {
+			ktime_get_clocktai_ts64(&ts);
+			break;
+		}
+#if IS_REACHABLE(CONFIG_PTP_1588_CLOCK)
+		ret = ptp_clock_gettime_by_index(cfg->ptp_index, &ts);
+		if (ret)
+			return ret;
+		break;
+#else
+		return -EOPNOTSUPP;
+#endif
+	case RK_LTC_SYNC_SOURCE_MONOTONIC:
+		ktime_get_ts64(&ts);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	*ns = timespec64_to_ns(&ts);
+
+	return 0;
+}
+
+static u64 rk_ltc_frame_frac_q16(u64 frame_rem, u64 frame_divisor)
+{
+	return div64_u64(frame_rem * RK_LTC_PHASE_ONE, frame_divisor);
+}
+
+static u64 rk_ltc_expected_phase_q16(struct rk_ltc *ltc, s64 ref_ns,
+				     struct rk_ltc_timecode *tc_out)
+{
+	bool drop = ltc->cfg.flags & RK_LTC_FLAG_DROP_FRAME;
+	u64 day_ns = rk_ltc_mod_day_ns(ref_ns);
+	u64 denom = (u64)ltc->rate.codeword_den * NSEC_PER_SEC;
+	u64 prod, frame, rem, linear, frac;
+	struct rk_ltc_timecode tc = {};
+	u32 nsec;
+	u64 sec;
+
+	if (drop) {
+		sec = div_u64_rem(day_ns, NSEC_PER_SEC, &nsec);
+		tc.seconds = do_div(sec, 60);
+		tc.minutes = do_div(sec, 60);
+		tc.hours = sec % 24;
+
+		prod = (u64)nsec * ltc->rate.codeword_num;
+		frame = div64_u64_rem(prod, denom, &rem);
+		if (frame >= ltc->rate.addr_fps) {
+			frame = ltc->rate.addr_fps - 1;
+			rem = 0;
+		}
+		tc.frames = frame;
+		if (!rk_ltc_time_valid(&tc, &ltc->rate, true)) {
+			tc.frames = 2;
+			rem = 0;
+		}
+		linear = rk_ltc_tc_to_linear(&tc, &ltc->rate, true);
+		frac = rk_ltc_frame_frac_q16(rem, denom);
+	} else {
+		prod = day_ns * ltc->rate.codeword_num;
+		frame = div64_u64_rem(prod, denom, &rem);
+		div64_u64_rem(frame, rk_ltc_frames_per_day(&ltc->rate, false),
+			      &linear);
+		rk_ltc_linear_to_tc(linear, &ltc->rate, false, &tc);
+		frac = rk_ltc_frame_frac_q16(rem, denom);
+	}
+
+	if (tc_out)
+		*tc_out = tc;
+
+	return (linear << RK_LTC_PHASE_SHIFT) + frac;
+}
+
+static s64 rk_ltc_phase_diff_q16(u64 expected, u64 current_phase, u64 period)
+{
+	s64 diff = (s64)expected - (s64)current_phase;
+	s64 half = (s64)period / 2;
+
+	if (diff > half)
+		diff -= period;
+	else if (diff < -half)
+		diff += period;
+
+	return diff;
+}
+
+static s64 rk_ltc_phase_q16_to_ns(struct rk_ltc *ltc, s64 phase)
+{
+	u64 ns_per_frame;
+
+	ns_per_frame = div64_u64((u64)ltc->rate.codeword_den * NSEC_PER_SEC,
+				 ltc->rate.codeword_num);
+
+	return (s64)mul_s64_u64_shr(phase, ns_per_frame,
+				    RK_LTC_PHASE_SHIFT);
+}
+
+static u64 rk_ltc_codeword_duration_ns(const struct rk_ltc *ltc)
+{
+	return div64_u64((u64)ltc->rate.codeword_den * NSEC_PER_SEC,
+			 ltc->rate.codeword_num);
+}
+
+static s64 rk_ltc_abs64(s64 value)
+{
+	return value < 0 ? -value : value;
+}
+
+static void rk_ltc_phase_q16_to_nearest_tc(struct rk_ltc *ltc, u64 phase,
+					   struct rk_ltc_timecode *tc)
+{
+	bool drop = ltc->cfg.flags & RK_LTC_FLAG_DROP_FRAME;
+	u64 frame, period;
+
+	period = rk_ltc_frames_per_day(&ltc->rate, drop);
+	frame = div64_u64(phase + (RK_LTC_PHASE_ONE / 2),
+			  RK_LTC_PHASE_ONE);
+	frame %= period;
+	rk_ltc_linear_to_tc(frame, &ltc->rate, drop, tc);
+}
+
+static s64 rk_ltc_clamp_pll_error(s64 phase_ns)
+{
+	return clamp_t(s64, phase_ns, -RK_LTC_PLL_ERROR_CLAMP_NS,
+		       RK_LTC_PLL_ERROR_CLAMP_NS);
+}
+
+static int rk_ltc_validate_sync_config(struct rk_ltc_sync_config *cfg)
+{
+	switch (cfg->source) {
+	case RK_LTC_SYNC_SOURCE_NONE:
+	case RK_LTC_SYNC_SOURCE_REALTIME:
+	case RK_LTC_SYNC_SOURCE_TAI:
+	case RK_LTC_SYNC_SOURCE_MONOTONIC:
+	case RK_LTC_SYNC_SOURCE_PTP_TAI:
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (cfg->ptp_index < -1)
+		return -EINVAL;
+	if (cfg->ptp_index >= 0) {
+		if (cfg->source != RK_LTC_SYNC_SOURCE_PTP_TAI)
+			return -EINVAL;
+#if !IS_REACHABLE(CONFIG_PTP_1588_CLOCK)
+		return -EOPNOTSUPP;
+#endif
+	}
+
+	if (!cfg->max_slew_ppm)
+		cfg->max_slew_ppm = RK_LTC_DEFAULT_MAX_SLEW_PPM;
+	if (cfg->max_slew_ppm < 0 ||
+	    cfg->max_slew_ppm > RK_LTC_MAX_SLEW_PPM)
+		return -EINVAL;
+	if (!cfg->lock_threshold_ms)
+		cfg->lock_threshold_ms = RK_LTC_DEFAULT_LOCK_THRESHOLD_MS;
+	if (cfg->lock_threshold_ms < 0)
+		return -EINVAL;
+	if (cfg->jump_threshold_ms < 0)
+		return -EINVAL;
+	if (!cfg->pll_kp_ppb_per_ms)
+		cfg->pll_kp_ppb_per_ms = RK_LTC_DEFAULT_PLL_KP_PPB_PER_MS;
+	if (!cfg->pll_ki_ppb_per_ms_s)
+		cfg->pll_ki_ppb_per_ms_s =
+			RK_LTC_DEFAULT_PLL_KI_PPB_PER_MS_S;
+	if (cfg->pll_kp_ppb_per_ms < 0 ||
+	    cfg->pll_kp_ppb_per_ms > RK_LTC_MAX_PLL_GAIN ||
+	    cfg->pll_ki_ppb_per_ms_s < 0 ||
+	    cfg->pll_ki_ppb_per_ms_s > RK_LTC_MAX_PLL_GAIN ||
+	    cfg->pll_deadband_us < 0)
+		return -EINVAL;
+	if (cfg->source != RK_LTC_SYNC_SOURCE_NONE)
+		cfg->flags |= RK_LTC_SYNC_FLAG_JAM_ON_START;
+
+	return 0;
+}
+
+static void rk_ltc_sync_reset_locked(struct rk_ltc *ltc)
+{
+	ltc->sync_correction_ppb = 0;
+	ltc->sync_integral_ppb = 0;
+	ltc->sync_phase_error_ns = 0;
+	ltc->sync_updates = 0;
+	ltc->sync_locked_updates = 0;
+	ltc->sync_jump_count = 0;
+	ltc->sync_last_jump_error_ns = 0;
+	ltc->sync_state = ltc->sync_cfg.source == RK_LTC_SYNC_SOURCE_NONE ?
+			  RK_LTC_SYNC_STATE_OFF : RK_LTC_SYNC_STATE_SLEWING;
+}
+
+static s32 rk_ltc_sync_pll_step_locked(struct rk_ltc *ltc, s64 phase_ns)
+{
+	const struct rk_ltc_sync_config *cfg = &ltc->sync_cfg;
+	s64 error_ns = rk_ltc_clamp_pll_error(phase_ns);
+	s64 error_us, integrated_us_s;
+	s64 p_ppb, i_delta_ppb, i_ppb, correction;
+	s64 max_ppb = (s64)cfg->max_slew_ppm * 1000;
+	u64 dt_ns;
+
+	if (cfg->pll_deadband_us &&
+	    rk_ltc_abs64(error_ns) <=
+	    (s64)cfg->pll_deadband_us * RK_LTC_NSEC_PER_USEC)
+		error_ns = 0;
+
+	error_us = div_s64(error_ns, RK_LTC_NSEC_PER_USEC);
+	p_ppb = div_s64(error_us * cfg->pll_kp_ppb_per_ms, 1000);
+
+	dt_ns = rk_ltc_codeword_duration_ns(ltc);
+	integrated_us_s = div64_s64((u64)rk_ltc_abs64(error_us) * dt_ns,
+				    NSEC_PER_SEC);
+	if (error_us < 0)
+		integrated_us_s = -integrated_us_s;
+	i_delta_ppb = div_s64(integrated_us_s *
+			      cfg->pll_ki_ppb_per_ms_s, 1000);
+
+	i_ppb = clamp_t(s64, (s64)ltc->sync_integral_ppb + i_delta_ppb,
+			-max_ppb, max_ppb);
+	correction = clamp_t(s64, p_ppb + i_ppb, -max_ppb, max_ppb);
+
+	if (correction != p_ppb + i_ppb)
+		i_ppb = clamp_t(s64, correction - p_ppb, -max_ppb, max_ppb);
+
+	ltc->sync_integral_ppb = i_ppb;
+	ltc->sync_correction_ppb = correction;
+
+	return correction;
+}
+
+static void rk_ltc_sync_update_locked(struct rk_ltc *ltc)
+{
+	const struct rk_ltc_sync_config *cfg = &ltc->sync_cfg;
+	u64 expected, current_phase, period;
+	s64 ref_ns, phase, phase_ns;
+	s64 abs_phase_ns;
+	bool locked;
+	int ret;
+
+	if (cfg->source == RK_LTC_SYNC_SOURCE_NONE) {
+		ltc->sync_state = RK_LTC_SYNC_STATE_OFF;
+		ltc->sync_correction_ppb = 0;
+		ltc->sync_integral_ppb = 0;
+		ltc->sync_phase_error_ns = 0;
+		return;
+	}
+
+	if (ltc->cfg.mode != RK_LTC_MODE_NORMAL) {
+		ltc->sync_state = RK_LTC_SYNC_STATE_HOLD;
+		ltc->sync_correction_ppb = 0;
+		return;
+	}
+
+	ret = rk_ltc_read_sync_time(cfg, &ref_ns);
+	if (ret) {
+		ltc->sync_state = RK_LTC_SYNC_STATE_HOLD;
+		ltc->sync_correction_ppb = 0;
+		return;
+	}
+
+	ref_ns += cfg->offset_ns + rk_ltc_pipeline_latency_ns(ltc);
+	expected = rk_ltc_expected_phase_q16(ltc, ref_ns, NULL);
+	current_phase = rk_ltc_tc_to_linear(&ltc->gen.tc, &ltc->rate,
+					    ltc->cfg.flags & RK_LTC_FLAG_DROP_FRAME);
+	current_phase <<= RK_LTC_PHASE_SHIFT;
+	period = rk_ltc_frames_per_day(&ltc->rate,
+				       ltc->cfg.flags & RK_LTC_FLAG_DROP_FRAME);
+	period <<= RK_LTC_PHASE_SHIFT;
+
+	phase = rk_ltc_phase_diff_q16(expected, current_phase, period);
+	phase_ns = rk_ltc_phase_q16_to_ns(ltc, phase);
+
+	abs_phase_ns = rk_ltc_abs64(phase_ns);
+	if (cfg->jump_threshold_ms &&
+	    abs_phase_ns >
+	    (s64)cfg->jump_threshold_ms * RK_LTC_NSEC_PER_MSEC) {
+		rk_ltc_phase_q16_to_nearest_tc(ltc, expected, &ltc->gen.tc);
+		current_phase = rk_ltc_tc_to_linear(&ltc->gen.tc, &ltc->rate,
+				ltc->cfg.flags & RK_LTC_FLAG_DROP_FRAME);
+		current_phase <<= RK_LTC_PHASE_SHIFT;
+		phase = rk_ltc_phase_diff_q16(expected, current_phase,
+					      period);
+		ltc->sync_jump_count++;
+		ltc->sync_last_jump_error_ns = phase_ns;
+		ltc->sync_integral_ppb = 0;
+	}
+
+	phase_ns = rk_ltc_phase_q16_to_ns(ltc, phase);
+	abs_phase_ns = rk_ltc_abs64(phase_ns);
+	rk_ltc_sync_pll_step_locked(ltc, phase_ns);
+	locked = abs_phase_ns <=
+		 (s64)cfg->lock_threshold_ms * RK_LTC_NSEC_PER_MSEC;
+
+	ltc->sync_phase_error_ns = phase_ns;
+	ltc->sync_state = locked ? RK_LTC_SYNC_STATE_LOCKED :
+			   RK_LTC_SYNC_STATE_SLEWING;
+	ltc->sync_updates++;
+	if (locked)
+		ltc->sync_locked_updates++;
+}
+
+static int rk_ltc_sync_jam_start_locked(struct rk_ltc *ltc)
+{
+	struct rk_ltc_timecode tc;
+	s64 ref_ns;
+	int ret;
+
+	if (ltc->sync_cfg.source == RK_LTC_SYNC_SOURCE_NONE ||
+	    !(ltc->sync_cfg.flags & RK_LTC_SYNC_FLAG_JAM_ON_START) ||
+	    ltc->cfg.mode != RK_LTC_MODE_NORMAL)
+		return 0;
+
+	ret = rk_ltc_read_sync_time(&ltc->sync_cfg, &ref_ns);
+	if (ret)
+		return ret;
+
+	ref_ns += ltc->sync_cfg.offset_ns;
+	rk_ltc_expected_phase_q16(ltc, ref_ns, &tc);
+	ltc->tc = tc;
+	ltc->current_tc = tc;
+
+	return 0;
+}
+
+static u64 rk_ltc_target_ns_from_tc(struct rk_ltc *ltc,
+				    const struct rk_ltc_timecode *tc)
+{
+	bool drop = ltc->cfg.flags & RK_LTC_FLAG_DROP_FRAME;
+	u64 linear, ns;
+
+	if (drop) {
+		ns = ((u64)tc->hours * 3600 + (u64)tc->minutes * 60 +
+		      tc->seconds) * NSEC_PER_SEC;
+		ns += div64_u64((u64)tc->frames * ltc->rate.codeword_den *
+				NSEC_PER_SEC, ltc->rate.codeword_num);
+		return ns % (24ULL * 60 * 60 * NSEC_PER_SEC);
+	}
+
+	linear = rk_ltc_tc_to_linear(tc, &ltc->rate, false);
+
+	return div64_u64(linear * (u64)ltc->rate.codeword_den *
+			 NSEC_PER_SEC, ltc->rate.codeword_num);
+}
+
+static int rk_ltc_sync_set_running_time_locked(struct rk_ltc *ltc,
+					       const struct rk_ltc_timecode *tc)
+{
+	unsigned long flags;
+	s64 ref_ns, offset;
+	u64 target_ns, ref_day_ns;
+	int ret;
+
+	if (ltc->sync_cfg.source == RK_LTC_SYNC_SOURCE_NONE)
+		return -EBUSY;
+
+	ret = rk_ltc_read_sync_time(&ltc->sync_cfg, &ref_ns);
+	if (ret)
+		return ret;
+
+	target_ns = rk_ltc_target_ns_from_tc(ltc, tc);
+	ref_ns += rk_ltc_pipeline_latency_ns(ltc);
+	ref_day_ns = rk_ltc_mod_day_ns(ref_ns);
+	offset = (s64)target_ns - (s64)ref_day_ns;
+	offset = rk_ltc_mod_day_ns(offset);
+	if (offset > 12LL * 60 * 60 * NSEC_PER_SEC)
+		offset -= 24LL * 60 * 60 * NSEC_PER_SEC;
+
+	spin_lock_irqsave(&ltc->state_lock, flags);
+	ltc->sync_cfg.offset_ns = offset;
+	ltc->sync_correction_ppb = 0;
+	ltc->sync_integral_ppb = 0;
+	ltc->sync_state = RK_LTC_SYNC_STATE_SLEWING;
+	spin_unlock_irqrestore(&ltc->state_lock, flags);
+
+	return 0;
+}
+
 static void rk_ltc_put_bcd(u8 *bits, unsigned int start,
 			   unsigned int count, unsigned int value)
 {
@@ -361,10 +845,19 @@ static u32 rk_ltc_next_bmc_half(struct rk_ltc *ltc)
 	struct rk_ltc_gen *gen = &ltc->gen;
 	u64 dividend, divisor, rem;
 	u64 len;
+	s64 scale_s64 = 1000000000LL + ltc->sync_correction_ppb;
+	u64 scale = scale_s64 > 0 ? (u64)scale_s64 : 1;
 
-	dividend = (u64)ltc->actual_sample_rate * ltc->rate.codeword_den +
-		   gen->half_rem;
-	divisor = 160ULL * ltc->rate.codeword_num;
+	dividend = (u64)ltc->actual_sample_rate * ltc->rate.codeword_den *
+		   1000000000ULL;
+	divisor = 160ULL * ltc->rate.codeword_num * scale;
+	if (gen->half_rem >= divisor) {
+		u64 old_rem;
+
+		div64_u64_rem(gen->half_rem, divisor, &old_rem);
+		gen->half_rem = old_rem;
+	}
+	dividend += gen->half_rem;
 	len = div64_u64_rem(dividend, divisor, &rem);
 	gen->half_rem = rem;
 
@@ -407,9 +900,11 @@ static u8 rk_ltc_next_bmc_sample(struct rk_ltc *ltc)
 			if (gen->bit_index == 80) {
 				gen->bit_index = 0;
 				ltc->codewords_generated++;
-				if (ltc->cfg.mode != RK_LTC_MODE_RAW_FRAME)
+				if (ltc->cfg.mode != RK_LTC_MODE_RAW_FRAME) {
 					rk_ltc_increment_time(&gen->tc, &ltc->rate,
 							      ltc->cfg.flags & RK_LTC_FLAG_DROP_FRAME);
+					rk_ltc_sync_update_locked(ltc);
+				}
 			}
 		}
 	}
@@ -485,6 +980,7 @@ static void rk_ltc_gen_reset_locked(struct rk_ltc *ltc)
 	ltc->dma_periods = 0;
 	ltc->underruns = 0;
 	ltc->period_pos = 0;
+	rk_ltc_sync_reset_locked(ltc);
 }
 
 static irqreturn_t rk_ltc_irq(int irq, void *data)
@@ -604,6 +1100,10 @@ static int rk_ltc_start_locked(struct rk_ltc *ltc)
 	if (ret)
 		return ret;
 
+	ret = rk_ltc_sync_jam_start_locked(ltc);
+	if (ret)
+		return ret;
+
 	spin_lock_irqsave(&ltc->state_lock, flags);
 	rk_ltc_gen_reset_locked(ltc);
 	for (i = 0; i < ltc->periods; i++)
@@ -657,7 +1157,6 @@ static int rk_ltc_apply_config_locked(struct rk_ltc *ltc,
 {
 	struct rk_ltc_config cfg = *new_cfg;
 	struct rk_ltc_rate rate;
-	bool was_running;
 	int ret;
 
 	if (!cfg.sample_rate)
@@ -671,9 +1170,8 @@ static int rk_ltc_apply_config_locked(struct rk_ltc *ltc,
 	if (ret)
 		return ret;
 
-	was_running = ltc->running;
-	if (was_running)
-		rk_ltc_stop_locked(ltc);
+	if (ltc->running)
+		return -EBUSY;
 
 	ltc->cfg = cfg;
 	ltc->rate = rate;
@@ -681,12 +1179,6 @@ static int rk_ltc_apply_config_locked(struct rk_ltc *ltc,
 	rk_ltc_clamp_time(&ltc->tc, &ltc->rate,
 			  ltc->cfg.flags & RK_LTC_FLAG_DROP_FRAME);
 	ltc->current_tc = ltc->tc;
-
-	if (was_running) {
-		ret = rk_ltc_start_locked(ltc);
-		if (ret)
-			return ret;
-	}
 
 	return 0;
 }
@@ -719,6 +1211,19 @@ static void rk_ltc_fill_status(struct rk_ltc *ltc, struct rk_ltc_status *st)
 	st->irq_count = ltc->irq_count;
 	st->decoder_locks = ltc->decoder_locks;
 	st->decoder_errors = ltc->decoder_errors;
+	st->sync_source = ltc->sync_cfg.source;
+	st->sync_state = ltc->sync_state;
+	st->sync_correction_ppb = ltc->sync_correction_ppb;
+	st->sync_correction_ppm = div_s64(ltc->sync_correction_ppb, 1000);
+	st->sync_integral_ppb = ltc->sync_integral_ppb;
+	st->sync_max_slew_ppm = ltc->sync_cfg.max_slew_ppm;
+	st->sync_phase_error_ns = ltc->sync_phase_error_ns;
+	st->sync_updates = ltc->sync_updates;
+	st->sync_locked_updates = ltc->sync_locked_updates;
+	st->sync_offset_ns = ltc->sync_cfg.offset_ns;
+	st->sync_ptp_index = ltc->sync_cfg.ptp_index;
+	st->sync_jump_count = ltc->sync_jump_count;
+	st->sync_last_jump_error_ns = ltc->sync_last_jump_error_ns;
 	spin_unlock_irqrestore(&ltc->state_lock, flags);
 
 	if (running) {
@@ -743,8 +1248,10 @@ static long rk_ltc_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct rk_ltc *ltc = file->private_data;
 	struct rk_ltc_config cfg;
+	struct rk_ltc_sync_config sync_cfg;
 	struct rk_ltc_timecode tc;
 	struct rk_ltc_status st;
+	unsigned long flags;
 	int ret = 0;
 
 	mutex_lock(&ltc->lock);
@@ -770,8 +1277,6 @@ static long rk_ltc_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		break;
 	case RK_LTC_IOC_SET_TIMECODE:
 	{
-		bool was_running;
-
 		if (copy_from_user(&tc, (void __user *)arg, sizeof(tc))) {
 			ret = -EFAULT;
 			break;
@@ -781,13 +1286,12 @@ static long rk_ltc_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			ret = -EINVAL;
 			break;
 		}
-		was_running = ltc->running;
-		if (was_running)
-			rk_ltc_stop_locked(ltc);
-		ltc->tc = tc;
-		ltc->current_tc = tc;
-		if (was_running)
-			ret = rk_ltc_start_locked(ltc);
+		if (ltc->running)
+			ret = rk_ltc_sync_set_running_time_locked(ltc, &tc);
+		else {
+			ltc->tc = tc;
+			ltc->current_tc = tc;
+		}
 		break;
 	}
 	case RK_LTC_IOC_GET_TIMECODE:
@@ -798,6 +1302,28 @@ static long rk_ltc_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case RK_LTC_IOC_GET_STATUS:
 		rk_ltc_fill_status(ltc, &st);
 		if (copy_to_user((void __user *)arg, &st, sizeof(st)))
+			ret = -EFAULT;
+		break;
+	case RK_LTC_IOC_SET_SYNC:
+		if (copy_from_user(&sync_cfg, (void __user *)arg,
+				   sizeof(sync_cfg))) {
+			ret = -EFAULT;
+			break;
+		}
+		ret = rk_ltc_validate_sync_config(&sync_cfg);
+		if (ret)
+			break;
+		spin_lock_irqsave(&ltc->state_lock, flags);
+		ltc->sync_cfg = sync_cfg;
+		rk_ltc_sync_reset_locked(ltc);
+		spin_unlock_irqrestore(&ltc->state_lock, flags);
+		break;
+	case RK_LTC_IOC_GET_SYNC:
+		spin_lock_irqsave(&ltc->state_lock, flags);
+		sync_cfg = ltc->sync_cfg;
+		spin_unlock_irqrestore(&ltc->state_lock, flags);
+		if (copy_to_user((void __user *)arg, &sync_cfg,
+				 sizeof(sync_cfg)))
 			ret = -EFAULT;
 		break;
 	default:
@@ -840,6 +1366,40 @@ static const char *rk_ltc_mode_name(u32 mode)
 	}
 }
 
+static const char *rk_ltc_sync_source_name(u32 source)
+{
+	switch (source) {
+	case RK_LTC_SYNC_SOURCE_NONE:
+		return "none";
+	case RK_LTC_SYNC_SOURCE_REALTIME:
+		return "realtime";
+	case RK_LTC_SYNC_SOURCE_TAI:
+		return "tai";
+	case RK_LTC_SYNC_SOURCE_MONOTONIC:
+		return "monotonic";
+	case RK_LTC_SYNC_SOURCE_PTP_TAI:
+		return "ptp-tai";
+	default:
+		return "unknown";
+	}
+}
+
+static const char *rk_ltc_sync_state_name(u32 state)
+{
+	switch (state) {
+	case RK_LTC_SYNC_STATE_OFF:
+		return "off";
+	case RK_LTC_SYNC_STATE_LOCKED:
+		return "locked";
+	case RK_LTC_SYNC_STATE_SLEWING:
+		return "slewing";
+	case RK_LTC_SYNC_STATE_HOLD:
+		return "hold";
+	default:
+		return "unknown";
+	}
+}
+
 static ssize_t status_show(struct device *dev,
 			   struct device_attribute *attr, char *buf)
 {
@@ -849,12 +1409,16 @@ static ssize_t status_show(struct device *dev,
 	rk_ltc_fill_status(ltc, &st);
 
 	return sysfs_emit(buf,
-			  "running=%u mode=%s rate=%u/%u sample=%u actual=%u divider=%u tc=%02u:%02u:%02u:%02u periods=%llu underruns=%llu\n",
+			  "running=%u mode=%s rate=%u/%u sample=%u actual=%u divider=%u tc=%02u:%02u:%02u:%02u periods=%llu underruns=%llu sync=%s state=%s phase_ns=%lld correction_ppb=%d jumps=%llu\n",
 			  st.running, rk_ltc_mode_name(st.mode), st.fps_num,
 			  st.fps_den, st.sample_rate, st.actual_sample_rate,
 			  st.divider, st.timecode.hours, st.timecode.minutes,
 			  st.timecode.seconds, st.timecode.frames,
-			  st.dma_periods, st.underruns);
+			  st.dma_periods, st.underruns,
+			  rk_ltc_sync_source_name(st.sync_source),
+			  rk_ltc_sync_state_name(st.sync_state),
+			  st.sync_phase_error_ns, st.sync_correction_ppb,
+			  st.sync_jump_count);
 }
 static DEVICE_ATTR_RO(status);
 
@@ -962,7 +1526,7 @@ static ssize_t timecode_store(struct device *dev,
 	unsigned int h, m, s, f;
 	int ret;
 
-	if (sscanf(buf, "%u:%u:%u:%u", &h, &m, &s, &f) != 4)
+	if (sscanf(buf, "%u:%u:%u%*[:;]%u", &h, &m, &s, &f) != 4)
 		return -EINVAL;
 
 	tc.hours = h;
@@ -974,14 +1538,12 @@ static ssize_t timecode_store(struct device *dev,
 	if (!rk_ltc_time_valid(&tc, &ltc->rate,
 			       ltc->cfg.flags & RK_LTC_FLAG_DROP_FRAME)) {
 		ret = -EINVAL;
+	} else if (ltc->running) {
+		ret = rk_ltc_sync_set_running_time_locked(ltc, &tc);
 	} else {
-		bool was_running = ltc->running;
-
-		if (was_running)
-			rk_ltc_stop_locked(ltc);
 		ltc->tc = tc;
 		ltc->current_tc = tc;
-		ret = was_running ? rk_ltc_start_locked(ltc) : 0;
+		ret = 0;
 	}
 	mutex_unlock(&ltc->lock);
 
@@ -1124,6 +1686,29 @@ static int rk_ltc_debugfs_show(struct seq_file *s, void *unused)
 	seq_printf(s, "irq_count: %llu\n", st.irq_count);
 	seq_printf(s, "decoder_locks: %llu\n", st.decoder_locks);
 	seq_printf(s, "decoder_errors: %llu\n", st.decoder_errors);
+	seq_printf(s, "sync_source: %s\n",
+		   rk_ltc_sync_source_name(st.sync_source));
+	seq_printf(s, "sync_state: %s\n",
+		   rk_ltc_sync_state_name(st.sync_state));
+	seq_printf(s, "sync_phase_error_ns: %lld\n",
+		   st.sync_phase_error_ns);
+	seq_printf(s, "sync_correction_ppm: %d\n",
+		   st.sync_correction_ppm);
+	seq_printf(s, "sync_correction_ppb: %d\n",
+		   st.sync_correction_ppb);
+	seq_printf(s, "sync_integral_ppb: %d\n",
+		   st.sync_integral_ppb);
+	seq_printf(s, "sync_max_slew_ppm: %d\n",
+		   st.sync_max_slew_ppm);
+	seq_printf(s, "sync_offset_ns: %lld\n",
+		   st.sync_offset_ns);
+	seq_printf(s, "sync_updates: %llu\n", st.sync_updates);
+	seq_printf(s, "sync_locked_updates: %llu\n",
+		   st.sync_locked_updates);
+	seq_printf(s, "sync_ptp_index: %d\n", st.sync_ptp_index);
+	seq_printf(s, "sync_jump_count: %llu\n", st.sync_jump_count);
+	seq_printf(s, "sync_last_jump_error_ns: %lld\n",
+		   st.sync_last_jump_error_ns);
 
 	return 0;
 }
@@ -1139,6 +1724,15 @@ static int rk_ltc_probe(struct platform_device *pdev)
 		.mode = RK_LTC_MODE_IDLE_LOW,
 		.sample_rate = RK_LTC_DEFAULT_SAMPLE_RATE,
 	};
+	struct rk_ltc_sync_config sync_cfg = {
+		.source = RK_LTC_SYNC_SOURCE_NONE,
+		.flags = RK_LTC_SYNC_FLAG_JAM_ON_START,
+		.max_slew_ppm = RK_LTC_DEFAULT_MAX_SLEW_PPM,
+		.lock_threshold_ms = RK_LTC_DEFAULT_LOCK_THRESHOLD_MS,
+		.ptp_index = -1,
+		.pll_kp_ppb_per_ms = RK_LTC_DEFAULT_PLL_KP_PPB_PER_MS,
+		.pll_ki_ppb_per_ms_s = RK_LTC_DEFAULT_PLL_KI_PPB_PER_MS_S,
+	};
 	unsigned long flags;
 	int ret;
 
@@ -1150,6 +1744,8 @@ static int rk_ltc_probe(struct platform_device *pdev)
 	mutex_init(&ltc->lock);
 	spin_lock_init(&ltc->state_lock);
 	platform_set_drvdata(pdev, ltc);
+	ltc->sync_cfg = sync_cfg;
+	ltc->sync_state = RK_LTC_SYNC_STATE_OFF;
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res)

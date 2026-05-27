@@ -290,6 +290,17 @@ extern void ptp_clock_event(struct ptp_clock *ptp,
 extern int ptp_clock_index(struct ptp_clock *ptp);
 
 /**
+ * ptp_clock_gettime_by_index() - read a registered PHC by device index
+ *
+ * @index:  PTP clock index, matching /dev/ptp<index>.
+ * @ts:     Holds the PHC timestamp on success.
+ *
+ * Return:  0 on success, negative errno otherwise.
+ */
+
+extern int ptp_clock_gettime_by_index(int index, struct timespec64 *ts);
+
+/**
  * ptp_find_pin() - obtain the pin index of a given auxiliary function
  *
  * The caller must hold ptp_clock::pincfg_mux.  Drivers do not have
@@ -349,6 +360,8 @@ static inline void ptp_clock_event(struct ptp_clock *ptp,
 { }
 static inline int ptp_clock_index(struct ptp_clock *ptp)
 { return -1; }
+static inline int ptp_clock_gettime_by_index(int index, struct timespec64 *ts)
+{ return -EOPNOTSUPP; }
 static inline int ptp_find_pin(struct ptp_clock *ptp,
 			       enum ptp_pin_function func, unsigned int chan)
 { return -1; }
