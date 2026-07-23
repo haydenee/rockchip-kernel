@@ -26,6 +26,9 @@
 #include <linux/usb/ch9.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_mux.h>
+#include <linux/workqueue.h>
+
+#include "phy-rockchip-usbdp.h"
 
 /* USBDP PHY Register Definitions */
 #define UDPHY_PCS				0x4000
@@ -76,6 +79,9 @@
 
 #define TRSV_LN2_MON_RX_CDR_DONE_OFFSET		0x1b84	/* trsv_reg06E1 */
 #define TRSV_LN2_MON_RX_CDR_LOCK_DONE		BIT(0)
+
+#define UDPHY_USB_LANE_SCAN_INTERVAL_MS		50
+#define UDPHY_USB_LANE_SCAN_TIMEOUT_MS		5000
 
 #define BIT_WRITEABLE_SHIFT			16
 #define PHY_AUX_DP_DATA_POL_NORMAL		0
@@ -156,6 +162,29 @@ struct rockchip_udphy {
 	struct typec_switch_dev *sw;
 	struct typec_mux_dev *mux;
 	struct mutex mutex; /* mutex to protect access to individual PHYs */
+	bool has_orientation_switch;
+	bool typec_dp_altmode;
+	bool typec_orientation_valid;
+	bool typec_flip;
+	bool usb_lane_scan_enabled;
+	bool usb_lane_scan_link_confirm_required;
+	bool usb_lane_scan_active;
+	bool usb_lane_scan_pending;
+	bool usb_lane_scan_candidate;
+	bool usb_lane_scan_link_confirmed;
+	bool usb_lane_scan_faulted;
+	bool usb_lane_last_good_valid;
+	bool usb_lane_last_good_flip;
+	bool system_suspended;
+	bool tearing_down;
+	bool usb_host_ready;
+	bool usb_lane_scan_generation_valid;
+	bool usb_lane_scan_attempt_valid;
+	struct delayed_work usb_lane_scan_work;
+	unsigned long usb_lane_scan_deadline;
+	u32 usb_lane_scan_generation;
+	u32 usb_lane_scan_candidate_generation;
+	u32 usb_lane_scan_switches;
 
 	/* clocks and rests */
 	int num_clks;
@@ -166,6 +195,7 @@ struct rockchip_udphy {
 	/* PHY status management */
 	bool flip;
 	bool mode_change;
+	bool u3_port_disabled;
 	u8 mode;
 	u8 status;
 
@@ -502,13 +532,18 @@ static int udphy_reset_deassert(struct rockchip_udphy *udphy, char *name)
 	return reset_control_deassert(udphy->rsts[idx]);
 }
 
-static void udphy_u3_port_disable(struct rockchip_udphy *udphy, u8 disable)
+static int udphy_u3_port_disable(struct rockchip_udphy *udphy, u8 disable)
 {
 	const struct rockchip_udphy_cfg *cfg = udphy->cfgs;
 	const struct udphy_grf_reg *preg;
+	int ret;
 
 	preg = udphy->id ? &cfg->grfcfg.usb3otg1_cfg : &cfg->grfcfg.usb3otg0_cfg;
-	grfreg_write(udphy->usbgrf, preg, disable);
+	ret = grfreg_write(udphy->usbgrf, preg, disable);
+	if (!ret)
+		udphy->u3_port_disabled = disable;
+
+	return ret;
 }
 
 static void udphy_usb_bvalid_enable(struct rockchip_udphy *udphy, u8 enable)
@@ -669,28 +704,451 @@ static int udphy_set_typec_default_mapping(struct rockchip_udphy *udphy)
 	return 0;
 }
 
+static void udphy_set_typec_usb_mapping(struct rockchip_udphy *udphy)
+{
+	if (udphy->flip) {
+		udphy->lane_mux_sel[0] = PHY_LANE_MUX_DP;
+		udphy->lane_mux_sel[1] = PHY_LANE_MUX_DP;
+		udphy->lane_mux_sel[2] = PHY_LANE_MUX_USB;
+		udphy->lane_mux_sel[3] = PHY_LANE_MUX_USB;
+	} else {
+		udphy->lane_mux_sel[0] = PHY_LANE_MUX_USB;
+		udphy->lane_mux_sel[1] = PHY_LANE_MUX_USB;
+		udphy->lane_mux_sel[2] = PHY_LANE_MUX_DP;
+		udphy->lane_mux_sel[3] = PHY_LANE_MUX_DP;
+	}
+
+	/* The unused pair is muxed away from USB, but DP stays disabled. */
+	udphy->mode = UDPHY_MODE_USB;
+	udphy->dp_lanes = 0;
+	gpiod_set_value_cansleep(udphy->sbu1_dc_gpio, 0);
+	gpiod_set_value_cansleep(udphy->sbu2_dc_gpio, 0);
+}
+
+static u32 udphy_lane_mux_value(struct rockchip_udphy *udphy)
+{
+	return FIELD_PREP(CMN_DP_LANE_MUX_N(3), udphy->lane_mux_sel[3]) |
+	       FIELD_PREP(CMN_DP_LANE_MUX_N(2), udphy->lane_mux_sel[2]) |
+	       FIELD_PREP(CMN_DP_LANE_MUX_N(1), udphy->lane_mux_sel[1]) |
+	       FIELD_PREP(CMN_DP_LANE_MUX_N(0), udphy->lane_mux_sel[0]);
+}
+
+static int udphy_apply_typec_usb_mapping(struct rockchip_udphy *udphy,
+					 bool report)
+{
+	u32 lane_reg, ln0, ln2, old_mapping, target;
+	bool was_disabled, write_committed = false;
+	int ret, rollback_ret;
+
+	if (!(udphy->status & UDPHY_MODE_USB))
+		return 0;
+
+	target = udphy_lane_mux_value(udphy);
+	ret = regmap_read(udphy->pma_regmap, CMN_LANE_MUX_AND_EN_OFFSET,
+			  &lane_reg);
+	if (ret)
+		return ret;
+
+	if ((lane_reg & (CMN_DP_LANE_MUX_ALL | CMN_DP_LANE_EN_ALL)) ==
+	    target)
+		return udphy_u3_port_disable(udphy, false);
+
+	old_mapping = lane_reg &
+		      (CMN_DP_LANE_MUX_ALL | CMN_DP_LANE_EN_ALL);
+
+	ret = regmap_read(udphy->pma_regmap,
+			  TRSV_LN0_MON_RX_CDR_DONE_OFFSET, &ln0);
+	if (ret)
+		return ret;
+
+	ret = regmap_read(udphy->pma_regmap,
+			  TRSV_LN2_MON_RX_CDR_DONE_OFFSET, &ln2);
+	if (ret)
+		return ret;
+
+	if ((ln0 & TRSV_LN0_MON_RX_CDR_LOCK_DONE) ||
+	    (ln2 & TRSV_LN2_MON_RX_CDR_LOCK_DONE)) {
+		dev_warn(udphy->dev,
+			 "refuse Type-C USB lane switch while CDR is locked\n");
+		return -EBUSY;
+	}
+
+	/* Quiesce PIPE before changing its physical lane pair. */
+	was_disabled = udphy->u3_port_disabled;
+	ret = udphy_u3_port_disable(udphy, true);
+	if (ret)
+		return ret;
+	usleep_range(1000, 2000);
+
+	ret = regmap_read(udphy->pma_regmap,
+			  TRSV_LN0_MON_RX_CDR_DONE_OFFSET, &ln0);
+	if (ret)
+		goto restore_port;
+	ret = regmap_read(udphy->pma_regmap,
+			  TRSV_LN2_MON_RX_CDR_DONE_OFFSET, &ln2);
+	if (ret)
+		goto restore_port;
+	if ((ln0 & TRSV_LN0_MON_RX_CDR_LOCK_DONE) ||
+	    (ln2 & TRSV_LN2_MON_RX_CDR_LOCK_DONE)) {
+		ret = -EBUSY;
+		goto restore_port;
+	}
+
+	ret = regmap_update_bits(udphy->pma_regmap,
+				 CMN_LANE_MUX_AND_EN_OFFSET,
+				 CMN_DP_LANE_MUX_ALL | CMN_DP_LANE_EN_ALL,
+				 target);
+	if (ret)
+		goto restore_port;
+	write_committed = true;
+
+	ret = regmap_read(udphy->pma_regmap, CMN_LANE_MUX_AND_EN_OFFSET,
+			  &lane_reg);
+	if (ret)
+		goto rollback_mapping;
+	if ((lane_reg & (CMN_DP_LANE_MUX_ALL | CMN_DP_LANE_EN_ALL)) !=
+	    target) {
+		ret = -EIO;
+		goto rollback_mapping;
+	}
+
+	ret = udphy_u3_port_disable(udphy, false);
+	if (ret)
+		goto rollback_mapping;
+	if (report)
+		dev_info(udphy->dev,
+			 "Type-C USB lanes switched to %s mapping\n",
+			 udphy->flip ? "reverse" : "normal");
+
+	return 0;
+
+rollback_mapping:
+	if (write_committed) {
+		rollback_ret = regmap_update_bits(udphy->pma_regmap,
+						  CMN_LANE_MUX_AND_EN_OFFSET,
+						  CMN_DP_LANE_MUX_ALL |
+						  CMN_DP_LANE_EN_ALL,
+						  old_mapping);
+		if (rollback_ret) {
+			dev_crit(udphy->dev,
+				 "failed to roll back Type-C USB lane mapping: %d\n",
+				 rollback_ret);
+			return -EUCLEAN;
+		}
+
+		rollback_ret = regmap_read(udphy->pma_regmap,
+					   CMN_LANE_MUX_AND_EN_OFFSET,
+					   &lane_reg);
+		if (rollback_ret ||
+		    (lane_reg & (CMN_DP_LANE_MUX_ALL |
+				CMN_DP_LANE_EN_ALL)) != old_mapping) {
+			dev_crit(udphy->dev,
+				 "Type-C USB lane rollback readback failed\n");
+			return -EUCLEAN;
+		}
+	}
+
+restore_port:
+	rollback_ret = udphy_u3_port_disable(udphy, was_disabled);
+	if (rollback_ret)
+		return rollback_ret;
+
+	return ret;
+}
+
+static int udphy_usb_cdr_status(struct rockchip_udphy *udphy,
+				bool *ln0_locked, bool *ln2_locked)
+{
+	u32 ln0, ln2;
+	int ret;
+
+	ret = regmap_read(udphy->pma_regmap,
+			  TRSV_LN0_MON_RX_CDR_DONE_OFFSET, &ln0);
+	if (ret)
+		return ret;
+
+	ret = regmap_read(udphy->pma_regmap,
+			  TRSV_LN2_MON_RX_CDR_DONE_OFFSET, &ln2);
+	if (ret)
+		return ret;
+
+	*ln0_locked = ln0 & TRSV_LN0_MON_RX_CDR_LOCK_DONE;
+	*ln2_locked = ln2 & TRSV_LN2_MON_RX_CDR_LOCK_DONE;
+
+	return 0;
+}
+
+static void udphy_usb_lane_scan_request_locked(struct rockchip_udphy *udphy)
+{
+	if (!udphy->usb_lane_scan_enabled || udphy->usb_lane_scan_faulted ||
+	    udphy->tearing_down) {
+		udphy->usb_lane_scan_pending = false;
+		return;
+	}
+
+	/* Repeated internal requests must not extend the current deadline. */
+	if (udphy->usb_lane_scan_active || udphy->usb_lane_scan_candidate ||
+	    udphy->usb_lane_scan_link_confirmed)
+		return;
+
+	udphy->usb_lane_scan_pending = true;
+	if (udphy->system_suspended ||
+	    (udphy->has_orientation_switch &&
+	     !udphy->typec_orientation_valid) ||
+	    !udphy->usb_host_ready ||
+	    udphy->typec_dp_altmode || udphy->mode != UDPHY_MODE_USB ||
+	    !(udphy->status & UDPHY_MODE_USB))
+		return;
+
+	udphy->usb_lane_scan_pending = false;
+	udphy->usb_lane_scan_active = true;
+	udphy->usb_lane_scan_deadline =
+		jiffies + msecs_to_jiffies(UDPHY_USB_LANE_SCAN_TIMEOUT_MS);
+	udphy->usb_lane_scan_switches = 0;
+	dev_info(udphy->dev,
+		 "USB lane auto-scan started from %s mapping\n",
+		 udphy->flip ? "reverse" : "normal");
+	mod_delayed_work(system_freezable_wq, &udphy->usb_lane_scan_work,
+			 msecs_to_jiffies(UDPHY_USB_LANE_SCAN_INTERVAL_MS));
+}
+
+static void udphy_usb_lane_scan_work(struct work_struct *work)
+{
+	struct rockchip_udphy *udphy =
+		container_of(work, struct rockchip_udphy,
+			     usb_lane_scan_work.work);
+	bool expected_locked, ln0_locked, ln2_locked, old_flip;
+	bool reschedule = false;
+	int ret;
+
+	mutex_lock(&udphy->mutex);
+	if (!udphy->usb_lane_scan_active ||
+	    udphy->usb_lane_scan_faulted || udphy->system_suspended ||
+	    udphy->tearing_down ||
+	    (udphy->has_orientation_switch &&
+	     !udphy->typec_orientation_valid) ||
+	    !udphy->usb_host_ready ||
+	    udphy->typec_dp_altmode || udphy->mode != UDPHY_MODE_USB ||
+	    !(udphy->status & UDPHY_MODE_USB)) {
+		udphy->usb_lane_scan_active = false;
+		goto unlock;
+	}
+
+	/* Never access or change the lane mux after either USB CDR locks. */
+	ret = udphy_usb_cdr_status(udphy, &ln0_locked, &ln2_locked);
+	if (ret) {
+		udphy->usb_lane_scan_active = false;
+		udphy->usb_lane_scan_pending = false;
+		dev_warn(udphy->dev,
+			 "USB lane auto-scan CDR read failed: %d\n", ret);
+		goto unlock;
+	}
+
+	if (ln0_locked || ln2_locked) {
+		udphy->usb_lane_scan_active = false;
+		udphy->usb_lane_scan_pending = false;
+		expected_locked = udphy->flip ? ln2_locked : ln0_locked;
+		if (expected_locked) {
+			if (udphy->usb_lane_scan_link_confirm_required) {
+				udphy->usb_lane_scan_candidate = true;
+				udphy->usb_lane_scan_candidate_generation =
+					udphy->usb_lane_scan_generation;
+				dev_info(udphy->dev,
+					 "USB lane auto-scan candidate %s mapping after %u switches; awaiting link confirmation\n",
+					 udphy->flip ? "reverse" : "normal",
+					 udphy->usb_lane_scan_switches);
+			} else {
+				udphy->usb_lane_last_good_valid = true;
+				udphy->usb_lane_last_good_flip = udphy->flip;
+				dev_info(udphy->dev,
+					 "USB lane auto-scan locked %s mapping after %u switches\n",
+					 udphy->flip ? "reverse" : "normal",
+					 udphy->usb_lane_scan_switches);
+			}
+		} else {
+			dev_warn(udphy->dev,
+				 "USB lane auto-scan stopped on unexpected CDR lock\n");
+		}
+		goto unlock;
+	}
+
+	if (time_after_eq(jiffies, udphy->usb_lane_scan_deadline)) {
+		bool restart = udphy->usb_lane_scan_pending;
+
+		old_flip = udphy->flip;
+		if (udphy->has_orientation_switch)
+			udphy->flip = udphy->typec_flip;
+		else if (udphy->usb_lane_last_good_valid)
+			udphy->flip = udphy->usb_lane_last_good_flip;
+		else
+			udphy->flip = false;
+		if (old_flip != udphy->flip) {
+			udphy_set_typec_usb_mapping(udphy);
+			ret = udphy_apply_typec_usb_mapping(udphy, false);
+			if (ret) {
+				udphy->flip = old_flip;
+				udphy_set_typec_usb_mapping(udphy);
+				if (ret == -EUCLEAN) {
+					udphy->usb_lane_scan_faulted = true;
+					udphy_u3_port_disable(udphy, true);
+				}
+				if (ret != -EBUSY)
+					dev_warn(udphy->dev,
+						 "USB lane auto-scan restore failed: %d\n",
+						 ret);
+			} else {
+				udphy->usb_lane_scan_switches++;
+			}
+		}
+		udphy->usb_lane_scan_active = false;
+		udphy->usb_lane_scan_pending = false;
+		dev_info(udphy->dev,
+			 "USB lane auto-scan timed out after %u switches\n",
+				 udphy->usb_lane_scan_switches);
+		if (restart)
+			udphy_usb_lane_scan_request_locked(udphy);
+		goto unlock;
+	}
+
+	old_flip = udphy->flip;
+	udphy->flip = !old_flip;
+	udphy_set_typec_usb_mapping(udphy);
+	ret = udphy_apply_typec_usb_mapping(udphy, false);
+	if (ret) {
+		udphy->flip = old_flip;
+		udphy_set_typec_usb_mapping(udphy);
+		udphy->usb_lane_scan_active = false;
+		udphy->usb_lane_scan_pending = false;
+		if (ret == -EUCLEAN) {
+			udphy->usb_lane_scan_faulted = true;
+			udphy_u3_port_disable(udphy, true);
+		}
+		if (ret == -EBUSY)
+			dev_info(udphy->dev,
+				 "USB lane auto-scan stopped as CDR locked\n");
+		else
+			dev_warn(udphy->dev,
+				 "USB lane auto-scan switch failed: %d\n", ret);
+		goto unlock;
+	}
+
+	udphy->usb_lane_scan_switches++;
+	reschedule = true;
+
+unlock:
+	if (reschedule)
+		mod_delayed_work(system_freezable_wq,
+				 &udphy->usb_lane_scan_work,
+				 msecs_to_jiffies(UDPHY_USB_LANE_SCAN_INTERVAL_MS));
+	mutex_unlock(&udphy->mutex);
+}
+
+static void udphy_usb_lane_scan_cancel(void *data)
+{
+	struct rockchip_udphy *udphy = data;
+
+	mutex_lock(&udphy->mutex);
+	udphy->tearing_down = true;
+	udphy->usb_lane_scan_active = false;
+	udphy->usb_lane_scan_pending = false;
+	udphy->usb_lane_scan_candidate = false;
+	udphy->usb_lane_scan_link_confirmed = false;
+	udphy->usb_lane_scan_attempt_valid = false;
+	mutex_unlock(&udphy->mutex);
+	cancel_delayed_work_sync(&udphy->usb_lane_scan_work);
+}
+
 static int udphy_orien_sw_set(struct typec_switch_dev *sw,
 			      enum typec_orientation orien)
 {
 	struct rockchip_udphy *udphy = typec_switch_get_drvdata(sw);
+	bool ln0_locked = false, ln2_locked = false;
+	bool old_flip, old_typec_flip, old_orientation_valid;
+	int ret = 0;
 
 	mutex_lock(&udphy->mutex);
+	if (udphy->tearing_down) {
+		ret = -ESHUTDOWN;
+		goto unlock_ret;
+	}
+	if (udphy->usb_lane_scan_faulted &&
+	    orien != TYPEC_ORIENTATION_NONE) {
+		ret = -EIO;
+		goto unlock_ret;
+	}
 
 	if (orien == TYPEC_ORIENTATION_NONE) {
+		udphy->usb_lane_scan_active = false;
+		udphy->usb_lane_scan_pending = false;
+		udphy->usb_lane_scan_candidate = false;
+		udphy->usb_lane_scan_link_confirmed = false;
+		udphy->usb_lane_scan_attempt_valid = false;
+		cancel_delayed_work(&udphy->usb_lane_scan_work);
+		udphy->typec_orientation_valid = false;
 		gpiod_set_value_cansleep(udphy->sbu1_dc_gpio, 0);
 		gpiod_set_value_cansleep(udphy->sbu2_dc_gpio, 0);
+		if (udphy->has_orientation_switch &&
+		    !udphy->typec_dp_altmode &&
+		    udphy->mode == UDPHY_MODE_USB &&
+		    (udphy->status & UDPHY_MODE_USB))
+			ret = udphy_u3_port_disable(udphy, true);
 		/* unattached */
 		udphy_usb_bvalid_enable(udphy, false);
 		goto unlock_ret;
 	}
 
-	udphy->flip = (orien == TYPEC_ORIENTATION_REVERSE) ? true : false;
-	udphy_set_typec_default_mapping(udphy);
+	old_flip = udphy->flip;
+	old_typec_flip = udphy->typec_flip;
+	old_orientation_valid = udphy->typec_orientation_valid;
+	udphy->typec_flip = orien == TYPEC_ORIENTATION_REVERSE;
+	if (udphy->system_suspended && udphy->usb_lane_scan_enabled) {
+		udphy->typec_orientation_valid = true;
+		udphy_usb_bvalid_enable(udphy, true);
+		udphy_usb_lane_scan_request_locked(udphy);
+		goto unlock_ret;
+	}
+
+	/*
+	 * A lane auto-scan may compensate a far-end plug flip while the local
+	 * CC orientation stays unchanged.  Preserve that selected mapping if
+	 * an active CDR is already locked.
+	 */
+	if (udphy->usb_lane_scan_enabled &&
+	    (udphy->status & UDPHY_MODE_USB) &&
+	    !udphy_usb_cdr_status(udphy, &ln0_locked, &ln2_locked) &&
+	    (ln0_locked || ln2_locked)) {
+		udphy->usb_lane_scan_active = false;
+		udphy->typec_orientation_valid = true;
+		udphy_usb_bvalid_enable(udphy, true);
+		goto unlock_ret;
+	}
+
+	udphy->flip = udphy->typec_flip;
+	if (udphy->typec_dp_altmode) {
+		udphy_set_typec_default_mapping(udphy);
+	} else if (udphy->mode == UDPHY_MODE_USB) {
+		udphy_set_typec_usb_mapping(udphy);
+		ret = udphy_apply_typec_usb_mapping(udphy, true);
+		if (ret) {
+			if (ret == -EUCLEAN) {
+				udphy->usb_lane_scan_faulted = true;
+				udphy_u3_port_disable(udphy, true);
+				goto unlock_ret;
+			}
+			udphy->flip = old_flip;
+			udphy->typec_flip = old_typec_flip;
+			udphy->typec_orientation_valid = old_orientation_valid;
+			udphy_set_typec_usb_mapping(udphy);
+			goto unlock_ret;
+		}
+	}
+	udphy->typec_orientation_valid = true;
 	udphy_usb_bvalid_enable(udphy, true);
+	udphy_usb_lane_scan_request_locked(udphy);
 
 unlock_ret:
 	mutex_unlock(&udphy->mutex);
-	return 0;
+	return ret;
 }
 
 static int udphy_setup_orien_switch(struct rockchip_udphy *udphy)
@@ -766,6 +1224,10 @@ static int udphy_status_check(struct rockchip_udphy *udphy)
 	}
 
 	if (udphy->mode & UDPHY_MODE_USB) {
+		/* USB-only Type-C validates CDR asynchronously after lane selection. */
+		if (udphy->usb_lane_scan_enabled)
+			return 0;
+
 		if (!udphy->flip) {
 			ret = regmap_read_poll_timeout(udphy->pma_regmap,
 						       TRSV_LN0_MON_RX_CDR_DONE_OFFSET, val,
@@ -821,13 +1283,14 @@ static int udphy_init(struct rockchip_udphy *udphy)
 	}
 
 	/* Step 3: configure lane mux */
-	regmap_update_bits(udphy->pma_regmap, CMN_LANE_MUX_AND_EN_OFFSET,
-			   CMN_DP_LANE_MUX_ALL | CMN_DP_LANE_EN_ALL,
-			   FIELD_PREP(CMN_DP_LANE_MUX_N(3), udphy->lane_mux_sel[3]) |
-			   FIELD_PREP(CMN_DP_LANE_MUX_N(2), udphy->lane_mux_sel[2]) |
-			   FIELD_PREP(CMN_DP_LANE_MUX_N(1), udphy->lane_mux_sel[1]) |
-			   FIELD_PREP(CMN_DP_LANE_MUX_N(0), udphy->lane_mux_sel[0]) |
-			   FIELD_PREP(CMN_DP_LANE_EN_ALL, 0));
+	ret = regmap_update_bits(udphy->pma_regmap,
+				 CMN_LANE_MUX_AND_EN_OFFSET,
+				 CMN_DP_LANE_MUX_ALL | CMN_DP_LANE_EN_ALL,
+				 udphy_lane_mux_value(udphy));
+	if (ret) {
+		dev_err(udphy->dev, "lane mux set error %d\n", ret);
+		goto assert_apb;
+	}
 
 	/* Step 4: deassert init rstn and wait for 200ns from datasheet */
 	if (udphy->mode & UDPHY_MODE_USB)
@@ -968,7 +1431,9 @@ static int udphy_get_initial_status(struct rockchip_udphy *udphy)
 		reset_control_deassert(udphy->rsts[i]);
 
 	regmap_read(udphy->pma_regmap, CMN_LANE_MUX_AND_EN_OFFSET, &value);
-	if (FIELD_GET(CMN_DP_LANE_MUX_ALL, value) && FIELD_GET(CMN_DP_LANE_EN_ALL, value))
+	if ((udphy->mode & UDPHY_MODE_DP) &&
+	    FIELD_GET(CMN_DP_LANE_MUX_ALL, value) &&
+	    FIELD_GET(CMN_DP_LANE_EN_ALL, value))
 		udphy->status = UDPHY_MODE_DP;
 	else
 		udphy_disable(udphy);
@@ -1354,18 +1819,32 @@ static const struct phy_ops rockchip_dp_phy_ops = {
 static int rockchip_u3phy_init(struct phy *phy)
 {
 	struct rockchip_udphy *udphy = phy_get_drvdata(phy);
+	bool wait_orientation;
 	int ret = 0;
 
 	mutex_lock(&udphy->mutex);
+	if (udphy->usb_lane_scan_faulted || udphy->tearing_down) {
+		udphy_u3_port_disable(udphy, true);
+		ret = udphy->usb_lane_scan_faulted ? -EIO : -ESHUTDOWN;
+		goto unlock;
+	}
+	wait_orientation = udphy->has_orientation_switch &&
+			   !udphy->typec_dp_altmode &&
+			   udphy->mode == UDPHY_MODE_USB &&
+			   !udphy->typec_orientation_valid;
 	/* DP only or high-speed, disable U3 port */
 	if (!(udphy->mode & UDPHY_MODE_USB) || udphy->hs) {
-		udphy_u3_port_disable(udphy, true);
+		ret = udphy_u3_port_disable(udphy, true);
 		goto unlock;
 	} else {
-		udphy_u3_port_disable(udphy, false);
+		ret = udphy_u3_port_disable(udphy, wait_orientation);
+		if (ret)
+			goto unlock;
 	}
 
 	ret = udphy_power_on(udphy, UDPHY_MODE_USB);
+	if (!ret)
+		udphy_usb_lane_scan_request_locked(udphy);
 
 unlock:
 	mutex_unlock(&udphy->mutex);
@@ -1378,10 +1857,18 @@ static int rockchip_u3phy_exit(struct phy *phy)
 	int ret = 0;
 
 	mutex_lock(&udphy->mutex);
+	udphy->usb_host_ready = false;
+	udphy->usb_lane_scan_attempt_valid = false;
+	udphy->usb_lane_scan_generation_valid = false;
 	/* DP only or high-speed */
 	if (!(udphy->mode & UDPHY_MODE_USB) || udphy->hs)
 		goto unlock;
 
+	udphy->usb_lane_scan_active = false;
+	udphy->usb_lane_scan_pending = false;
+	udphy->usb_lane_scan_candidate = false;
+	udphy->usb_lane_scan_link_confirmed = false;
+	cancel_delayed_work(&udphy->usb_lane_scan_work);
 	ret = udphy_power_off(udphy, UDPHY_MODE_USB);
 
 unlock:
@@ -1389,9 +1876,155 @@ unlock:
 	return ret;
 }
 
+/* The caller must hold udphy->mutex. */
+static int udphy_lane_scan_confirm_locked(struct rockchip_udphy *udphy,
+					  u32 generation)
+{
+	bool expected_locked, ln0_locked, ln2_locked;
+	int ret;
+
+	if (!udphy->usb_lane_scan_enabled ||
+	    !udphy->usb_lane_scan_link_confirm_required)
+		return -EOPNOTSUPP;
+	if (udphy->usb_lane_scan_faulted || udphy->system_suspended ||
+	    udphy->tearing_down || !udphy->usb_host_ready ||
+	    udphy->typec_dp_altmode || udphy->mode != UDPHY_MODE_USB ||
+	    !(udphy->status & UDPHY_MODE_USB))
+		return -EAGAIN;
+	if (!udphy->usb_lane_scan_generation_valid ||
+	    !udphy->usb_lane_scan_attempt_valid ||
+	    generation != udphy->usb_lane_scan_generation)
+		return -ESTALE;
+	if (udphy->usb_lane_scan_link_confirmed)
+		return 0;
+	if (!udphy->usb_lane_scan_candidate ||
+	    udphy->usb_lane_scan_candidate_generation != generation)
+		return -EAGAIN;
+
+	ret = udphy_usb_cdr_status(udphy, &ln0_locked, &ln2_locked);
+	if (ret)
+		return ret;
+	expected_locked = udphy->flip ? ln2_locked : ln0_locked;
+	if (!expected_locked)
+		return -ENOLINK;
+
+	udphy->usb_lane_scan_active = false;
+	udphy->usb_lane_scan_pending = false;
+	udphy->usb_lane_scan_candidate = false;
+	udphy->usb_lane_scan_link_confirmed = true;
+	udphy->usb_lane_last_good_valid = true;
+	udphy->usb_lane_last_good_flip = udphy->flip;
+	cancel_delayed_work(&udphy->usb_lane_scan_work);
+	dev_info(udphy->dev,
+		 "USB lane auto-scan confirmed %s mapping by direct SuperSpeed link\n",
+		 udphy->flip ? "reverse" : "normal");
+
+	return 0;
+}
+
+static bool udphy_lane_scan_generation_is_older(struct rockchip_udphy *udphy,
+						u32 generation)
+{
+	u32 delta;
+
+	if (!udphy->usb_lane_scan_generation_valid)
+		return false;
+
+	delta = (generation - udphy->usb_lane_scan_generation) &
+		ROCKCHIP_UDPHY_USB_LANE_SCAN_GENERATION_MASK;
+
+	return delta >=
+	       (ROCKCHIP_UDPHY_USB_LANE_SCAN_GENERATION_MASK + 1) / 2;
+}
+
+static int rockchip_u3phy_set_mode(struct phy *phy, enum phy_mode mode,
+				   int submode)
+{
+	struct rockchip_udphy *udphy = phy_get_drvdata(phy);
+	enum rockchip_udphy_usb_lane_scan_event event;
+	u32 generation;
+	int ret = 0;
+
+	mutex_lock(&udphy->mutex);
+	switch (mode) {
+	case PHY_MODE_USB_HOST:
+		event = rockchip_udphy_usb_lane_scan_event(submode);
+		generation = rockchip_udphy_usb_lane_scan_generation(submode);
+		if (event != ROCKCHIP_UDPHY_USB_LANE_SCAN_NONE &&
+		    (!udphy->usb_lane_scan_enabled ||
+		     !udphy->usb_lane_scan_link_confirm_required)) {
+			ret = -EOPNOTSUPP;
+			break;
+		}
+		if (event == ROCKCHIP_UDPHY_USB_LANE_SCAN_ATTACH_END) {
+			if (udphy_lane_scan_generation_is_older(udphy, generation)) {
+				ret = -ESTALE;
+				break;
+			}
+			if (udphy->usb_lane_scan_candidate)
+				dev_info(udphy->dev,
+					 "USB lane candidate ended without SuperSpeed confirmation\n");
+			udphy->usb_lane_scan_generation_valid = true;
+			udphy->usb_lane_scan_attempt_valid = false;
+			udphy->usb_lane_scan_generation = generation;
+			udphy->usb_lane_scan_active = false;
+			udphy->usb_lane_scan_pending = false;
+			udphy->usb_lane_scan_candidate = false;
+			udphy->usb_lane_scan_link_confirmed = false;
+			cancel_delayed_work(&udphy->usb_lane_scan_work);
+		} else if (event ==
+			   ROCKCHIP_UDPHY_USB_LANE_SCAN_ATTACH_BEGIN) {
+			if (udphy_lane_scan_generation_is_older(udphy, generation)) {
+				ret = -ESTALE;
+				break;
+			}
+			if (udphy->usb_lane_scan_generation_valid &&
+			    udphy->usb_lane_scan_generation == generation &&
+			    udphy->usb_lane_scan_attempt_valid) {
+				udphy_usb_lane_scan_request_locked(udphy);
+				break;
+			}
+			udphy->usb_lane_scan_generation_valid = true;
+			udphy->usb_lane_scan_attempt_valid = true;
+			udphy->usb_lane_scan_generation = generation;
+			udphy->usb_lane_scan_active = false;
+			udphy->usb_lane_scan_pending = false;
+			udphy->usb_lane_scan_candidate = false;
+			udphy->usb_lane_scan_link_confirmed = false;
+			cancel_delayed_work(&udphy->usb_lane_scan_work);
+			udphy_usb_lane_scan_request_locked(udphy);
+		} else if (event == ROCKCHIP_UDPHY_USB_LANE_SCAN_NONE) {
+			udphy->usb_host_ready = true;
+			udphy_usb_lane_scan_request_locked(udphy);
+		} else if (event ==
+			   ROCKCHIP_UDPHY_USB_LANE_SCAN_LINK_CONFIRMED) {
+			ret = udphy_lane_scan_confirm_locked(udphy, generation);
+		} else {
+			ret = -EINVAL;
+		}
+		break;
+	case PHY_MODE_USB_DEVICE:
+	case PHY_MODE_USB_OTG:
+		udphy->usb_host_ready = false;
+		udphy->usb_lane_scan_attempt_valid = false;
+		udphy->usb_lane_scan_active = false;
+		udphy->usb_lane_scan_pending = false;
+		udphy->usb_lane_scan_candidate = false;
+		udphy->usb_lane_scan_link_confirmed = false;
+		cancel_delayed_work(&udphy->usb_lane_scan_work);
+		break;
+	default:
+		break;
+	}
+	mutex_unlock(&udphy->mutex);
+
+	return ret;
+}
+
 static const struct phy_ops rockchip_u3phy_ops = {
 	.init		= rockchip_u3phy_init,
 	.exit		= rockchip_u3phy_exit,
+	.set_mode	= rockchip_u3phy_set_mode,
 	.owner		= THIS_MODULE,
 };
 
@@ -1523,6 +2156,19 @@ static int rockchip_udphy_probe(struct platform_device *pdev)
 	udphy = devm_kzalloc(dev, sizeof(*udphy), GFP_KERNEL);
 	if (!udphy)
 		return -ENOMEM;
+	mutex_init(&udphy->mutex);
+	INIT_DELAYED_WORK(&udphy->usb_lane_scan_work,
+			  udphy_usb_lane_scan_work);
+	udphy->dev = dev;
+	platform_set_drvdata(pdev, udphy);
+	udphy->has_orientation_switch =
+		device_property_present(dev, "orientation-switch");
+	udphy->typec_dp_altmode = device_property_present(dev, "svid");
+	udphy->usb_lane_scan_enabled =
+		device_property_read_bool(dev, "rockchip,usb-lane-auto-scan");
+	udphy->usb_lane_scan_link_confirm_required =
+		device_property_read_bool(dev,
+					  "rockchip,usb-lane-scan-link-confirm");
 
 	id = of_alias_get_id(dev->of_node, "usbdp");
 	if (id < 0)
@@ -1550,16 +2196,27 @@ static int rockchip_udphy_probe(struct platform_device *pdev)
 	ret = udphy_parse_dt(udphy, dev);
 	if (ret)
 		return ret;
+	if (udphy->usb_lane_scan_enabled &&
+	    (udphy->typec_dp_altmode || udphy->mode != UDPHY_MODE_USB ||
+	     udphy->hs))
+		return dev_err_probe(dev, -EINVAL,
+			"USB lane auto-scan requires an enabled USB3-only lane mode\n");
+	if (udphy->usb_lane_scan_link_confirm_required &&
+	    !udphy->usb_lane_scan_enabled)
+		return dev_err_probe(dev, -EINVAL,
+			"USB lane link confirmation requires lane auto-scan\n");
+	if ((udphy->has_orientation_switch || udphy->usb_lane_scan_enabled) &&
+	    !udphy->typec_dp_altmode && udphy->mode == UDPHY_MODE_USB)
+		udphy_set_typec_usb_mapping(udphy);
+	if (udphy->usb_lane_scan_enabled)
+		dev_warn(dev, "enabled non-standard Type-C USB lane auto-scan%s\n",
+			 udphy->has_orientation_switch ? "" : " without CC orientation");
 
 	ret = udphy_get_initial_status(udphy);
 	if (ret)
 		return ret;
 
-	mutex_init(&udphy->mutex);
-	udphy->dev = dev;
-	platform_set_drvdata(pdev, udphy);
-
-	if (device_property_present(dev, "orientation-switch")) {
+	if (udphy->has_orientation_switch) {
 		ret = udphy_setup_orien_switch(udphy);
 		if (ret)
 			return ret;
@@ -1569,7 +2226,14 @@ static int rockchip_udphy_probe(struct platform_device *pdev)
 			return ret;
 	}
 
-	if (device_property_present(dev, "svid")) {
+	if (udphy->usb_lane_scan_enabled) {
+		ret = devm_add_action_or_reset(dev, udphy_usb_lane_scan_cancel,
+					       udphy);
+		if (ret)
+			return ret;
+	}
+
+	if (udphy->typec_dp_altmode) {
 		ret = udphy_setup_typec_mux(udphy);
 		if (ret)
 			return ret;
@@ -1616,6 +2280,23 @@ put_child:
 	return ret;
 }
 
+static int __maybe_unused udphy_suspend(struct device *dev)
+{
+	struct rockchip_udphy *udphy = dev_get_drvdata(dev);
+
+	mutex_lock(&udphy->mutex);
+	udphy->system_suspended = true;
+	udphy->usb_lane_scan_active = false;
+	udphy->usb_lane_scan_pending = false;
+	udphy->usb_lane_scan_candidate = false;
+	udphy->usb_lane_scan_link_confirmed = false;
+	udphy->usb_lane_scan_attempt_valid = false;
+	mutex_unlock(&udphy->mutex);
+	cancel_delayed_work_sync(&udphy->usb_lane_scan_work);
+
+	return 0;
+}
+
 static int __maybe_unused udphy_resume(struct device *dev)
 {
 	struct rockchip_udphy *udphy = dev_get_drvdata(dev);
@@ -1623,11 +2304,18 @@ static int __maybe_unused udphy_resume(struct device *dev)
 	if (udphy->dp_sink_hpd_sel)
 		udphy_dp_hpd_event_trigger(udphy, udphy->dp_sink_hpd_cfg);
 
+	mutex_lock(&udphy->mutex);
+	udphy->system_suspended = false;
+	if (!udphy->usb_lane_scan_link_confirm_required ||
+	    udphy->usb_lane_scan_pending)
+		udphy_usb_lane_scan_request_locked(udphy);
+	mutex_unlock(&udphy->mutex);
+
 	return 0;
 }
 
 static const struct dev_pm_ops udphy_pm_ops = {
-	SET_LATE_SYSTEM_SLEEP_PM_OPS(NULL, udphy_resume)
+	SET_LATE_SYSTEM_SLEEP_PM_OPS(udphy_suspend, udphy_resume)
 };
 
 static const char * const udphy_rst_list[] = {

@@ -250,7 +250,7 @@
 	};
 
 	dp0_sound: dp0-sound {
-		status = "okay";
+		status = "disabled";
 		compatible = "rockchip,hdmi";
 		rockchip,card-name = "rockchip-dp0";
 		rockchip,mclk-fs = <512>;
@@ -347,7 +347,7 @@
 };
 
 &spdif_tx2 {
-	status = "okay";
+	status = "disabled";
 };
 
 &i2s5_8ch {
@@ -453,6 +453,8 @@
 		pinctrl-names = "default";
 		pinctrl-0 = <&fusb302_int>;
 		vbus-supply = <&vbus_typec>;
+		/* Detect local CC polarity without enabling the Sink-only VBUS rail. */
+		fcs,sink-cc-orientation-probe;
 		status = "okay";
 
 		ports {
@@ -481,17 +483,6 @@
 			// source-pdos =
 			// 	<PDO_FIXED(5000, 3000, PDO_FIXED_USB_COMM)>;
 
-			altmodes {
-				#address-cells = <1>;
-				#size-cells = <0>;
-
-				altmode@0 {
-					reg = <0>;
-					svid = <0xff01>;
-					vdo = <0xffffffff>;
-				};
-			};
-
 			ports {
 				#address-cells = <1>;
 				#size-cells = <0>;
@@ -500,13 +491,6 @@
 					reg = <0>;
 					usbc0_orien_sw: endpoint {
 						remote-endpoint = <&usbdp_phy0_orientation_switch>;
-					};
-				};
-
-				port@1 {
-					reg = <1>;
-					dp_altmode_mux: endpoint {
-						remote-endpoint = <&usbdp_phy0_dp_altmode_mux>;
 					};
 				};
 			};
@@ -1372,8 +1356,8 @@
 /* USB3.1/DP Combo PHY1 */
 &usbdp_phy1 {
 	status = "okay";
-	// orientation-switch;
-	// svid = <0xff01>;
+	rockchip,usb-lane-auto-scan;
+	rockchip,usb-lane-scan-link-confirm;
 	sbu1-dc-gpios = <&gpio1 RK_PA2 GPIO_ACTIVE_HIGH>;
 	sbu2-dc-gpios = <&gpio1 RK_PA3 GPIO_ACTIVE_HIGH>;
 };
@@ -1394,7 +1378,7 @@
 /* USB3.1/DP Combo PHY0 */
 &usbdp_phy0 {
 	orientation-switch;
-	svid = <0xff01>;
+	rockchip,usb-lane-auto-scan;
 	sbu1-dc-gpios = <&gpio1 RK_PB0 GPIO_ACTIVE_HIGH>;
 	sbu2-dc-gpios = <&gpio1 RK_PB1 GPIO_ACTIVE_HIGH>;
 	status = "okay";
@@ -1406,11 +1390,6 @@
 			reg = <0>;
 			remote-endpoint = <&usbc0_orien_sw>;
 		};
-
-		usbdp_phy0_dp_altmode_mux: endpoint@1 {
-			reg = <1>;
-			remote-endpoint = <&dp_altmode_mux>;
-		};
 	};
 };
 
@@ -1419,7 +1398,7 @@
 };
 
 &usbdp_phy0_dp {
-	status = "okay";
+	status = "disabled";
 };
 
 /* USB3.1 OTG0 Controller  */
@@ -1458,6 +1437,7 @@
 
 &u2phy1_otg {
 	rockchip,typec-vbus-det;
+	rockchip,usb3-lane-scan-trigger;
 	status = "okay";
 };
 
@@ -1528,12 +1508,11 @@
 
 /* dp0 display */
 &dp0 {
-	status = "okay";
+	status = "disabled";
 };
 
 &route_dp0 {
-	status = "okay";
-	connect = <&vp1_out_dp0>;
+	status = "disabled";
 };
 
 &dp0_in_vp0 {
@@ -1541,7 +1520,7 @@
 };
 
 &dp0_in_vp1 {
-	status = "okay";
+	status = "disabled";
 };
 
 &dp0_in_vp2 {
@@ -1661,7 +1640,7 @@
 
 	usb-typec {
 		fusb302_int: fusb302-int {
-			rockchip,pins = <0 RK_PC4 RK_FUNC_GPIO &pcfg_pull_up>;
+			rockchip,pins = <1 RK_PA4 RK_FUNC_GPIO &pcfg_pull_up>;
 		};
 
 		typec_vbus_en: typec-vbus-en {

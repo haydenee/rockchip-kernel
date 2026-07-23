@@ -1787,8 +1787,11 @@ static int android_device_create(struct gadget_info *gi)
 
 		err = device_create_file(gi->dev, attr);
 		if (err) {
-			device_destroy(gi->dev->class,
-				       gi->dev->devt);
+			if (android_device == gi->dev)
+				android_device = NULL;
+			dev_set_drvdata(gi->dev, NULL);
+			device_unregister(gi->dev);
+			gi->dev = NULL;
 			return err;
 		}
 	}
@@ -1800,11 +1803,18 @@ static void android_device_destroy(struct gadget_info *gi)
 {
 	struct device_attribute **attrs;
 	struct device_attribute *attr;
+	struct device *dev = gi->dev;
+
+	cancel_work_sync(&gi->work);
 
 	attrs = android_usb_attributes;
 	while ((attr = *attrs++))
-		device_remove_file(gi->dev, attr);
-	device_destroy(gi->dev->class, gi->dev->devt);
+		device_remove_file(dev, attr);
+	dev_set_drvdata(dev, NULL);
+	if (android_device == dev)
+		android_device = NULL;
+	device_unregister(dev);
+	gi->dev = NULL;
 }
 #else
 static inline int android_device_create(struct gadget_info *gi)
@@ -1891,8 +1901,8 @@ static void gadgets_drop(struct config_group *group, struct config_item *item)
 	struct gadget_info *gi;
 
 	gi = container_of(to_config_group(item), struct gadget_info, group);
-	config_item_put(item);
 	android_device_destroy(gi);
+	config_item_put(item);
 }
 
 static struct configfs_group_operations gadgets_ops = {

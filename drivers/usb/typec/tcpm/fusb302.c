@@ -27,6 +27,7 @@
 #include <linux/types.h>
 #include <linux/usb.h>
 #include <linux/usb/typec.h>
+#include <linux/usb/typec_mux.h>
 #include <linux/usb/tcpm.h>
 #include <linux/usb/pd.h>
 #include <linux/workqueue.h>
@@ -41,6 +42,8 @@
  * longer than PD_T_PD_DEBPUNCE (10-20ms).
  */
 #define T_BC_LVL_DEBOUNCE_DELAY_MS 30
+#define T_ORIENTATION_PROBE_OPEN_MS 20
+#define T_ORIENTATION_PROBE_PRESENT_MS 50
 
 enum toggling_mode {
 	TOGGLING_MODE_OFF,
@@ -89,6 +92,11 @@ struct fusb302_chip {
 
 	struct workqueue_struct *wq;
 	struct delayed_work bc_lvl_handler;
+	struct delayed_work orientation_probe_work;
+	struct typec_switch *orientation_sw;
+	bool orientation_probe_enabled;
+	bool orientation_probe_paused;
+	enum typec_orientation probed_orientation;
 
 	/* lock for sharing chip states */
 	struct mutex lock;
@@ -1304,6 +1312,307 @@ static int fusb302_get_src_cc_status(struct fusb302_chip *chip,
 	return 0;
 }
 
+struct fusb302_orientation_probe_regs {
+	u8 switches0;
+	u8 measure;
+	u8 control0;
+	u8 control2;
+	u8 mask;
+	u8 maska;
+};
+
+static int fusb302_orientation_probe_cc(struct fusb302_chip *chip,
+					enum typec_cc_polarity polarity,
+					enum typec_cc_status *cc)
+{
+	u8 switches0, status0;
+	int ret;
+
+	/* Keep Rd on the other CC pin while briefly measuring this one. */
+	if (polarity == TYPEC_POLARITY_CC1)
+		switches0 = FUSB_REG_SWITCHES0_CC1_PU_EN |
+			    FUSB_REG_SWITCHES0_MEAS_CC1 |
+			    FUSB_REG_SWITCHES0_CC2_PD_EN;
+	else
+		switches0 = FUSB_REG_SWITCHES0_CC2_PU_EN |
+			    FUSB_REG_SWITCHES0_MEAS_CC2 |
+			    FUSB_REG_SWITCHES0_CC1_PD_EN;
+
+	ret = fusb302_i2c_write(chip, FUSB_REG_SWITCHES0, switches0);
+	if (ret < 0)
+		return ret;
+
+	ret = fusb302_i2c_write(chip, FUSB_REG_MEASURE,
+				rd_mda_value[SRC_CURRENT_DEFAULT]);
+	if (ret < 0)
+		return ret;
+
+	usleep_range(50, 100);
+	ret = fusb302_i2c_read(chip, FUSB_REG_STATUS0, &status0);
+	if (ret < 0)
+		return ret;
+
+	if (status0 & FUSB_REG_STATUS0_COMP) {
+		*cc = TYPEC_CC_OPEN;
+		return 0;
+	}
+
+	ret = fusb302_i2c_write(chip, FUSB_REG_MEASURE,
+				ra_mda_value[SRC_CURRENT_DEFAULT]);
+	if (ret < 0)
+		return ret;
+
+	usleep_range(50, 100);
+	ret = fusb302_i2c_read(chip, FUSB_REG_STATUS0, &status0);
+	if (ret < 0)
+		return ret;
+
+	*cc = status0 & FUSB_REG_STATUS0_COMP ? TYPEC_CC_RD : TYPEC_CC_RA;
+
+	return 0;
+}
+
+static int fusb302_probe_restore(struct fusb302_chip *chip,
+				 const struct fusb302_orientation_probe_regs *saved)
+{
+	int first = 0, ret;
+
+#define FUSB302_RESTORE_REG(_reg, _value) do { \
+	ret = fusb302_i2c_write(chip, (_reg), (_value)); \
+	if (ret < 0 && !first) \
+		first = ret; \
+} while (0)
+
+	/* Keep all relevant interrupts masked until the Sink state is back. */
+	FUSB302_RESTORE_REG(FUSB_REG_MASK, 0xff);
+	FUSB302_RESTORE_REG(FUSB_REG_MASKA, 0xff);
+	FUSB302_RESTORE_REG(FUSB_REG_SWITCHES0, saved->switches0);
+	FUSB302_RESTORE_REG(FUSB_REG_MEASURE, saved->measure);
+	FUSB302_RESTORE_REG(FUSB_REG_CONTROL0, saved->control0);
+	FUSB302_RESTORE_REG(FUSB_REG_CONTROL2, saved->control2);
+	FUSB302_RESTORE_REG(FUSB_REG_MASKA, saved->maska);
+	FUSB302_RESTORE_REG(FUSB_REG_MASK, saved->mask);
+
+#undef FUSB302_RESTORE_REG
+
+	return first;
+}
+
+static int fusb302_orientation_probe_locked(struct fusb302_chip *chip,
+					    enum typec_orientation *orientation)
+{
+	struct fusb302_orientation_probe_regs saved;
+	enum typec_cc_status cc1, cc2;
+	u8 control2;
+	int ret, restore_ret;
+
+	*orientation = TYPEC_ORIENTATION_NONE;
+
+	if (chip->toggling_mode != TOGGLING_MODE_SNK ||
+	    chip->cc1 != TYPEC_CC_OPEN || chip->cc2 != TYPEC_CC_OPEN ||
+	    chip->vconn_on || chip->vbus_on || chip->charge_on)
+		return -EAGAIN;
+
+	ret = regulator_is_enabled(chip->vbus);
+	if (ret < 0)
+		return ret;
+	if (ret)
+		return -EPERM;
+
+	ret = fusb302_i2c_read(chip, FUSB_REG_SWITCHES0, &saved.switches0);
+	if (ret < 0)
+		return ret;
+	ret = fusb302_i2c_read(chip, FUSB_REG_MEASURE, &saved.measure);
+	if (ret < 0)
+		return ret;
+	ret = fusb302_i2c_read(chip, FUSB_REG_CONTROL0, &saved.control0);
+	if (ret < 0)
+		return ret;
+	ret = fusb302_i2c_read(chip, FUSB_REG_CONTROL2, &saved.control2);
+	if (ret < 0)
+		return ret;
+	ret = fusb302_i2c_read(chip, FUSB_REG_MASK, &saved.mask);
+	if (ret < 0)
+		return ret;
+	ret = fusb302_i2c_read(chip, FUSB_REG_MASKA, &saved.maska);
+	if (ret < 0)
+		return ret;
+
+	ret = fusb302_i2c_write(chip, FUSB_REG_MASK, 0xff);
+	if (ret < 0)
+		goto restore;
+	ret = fusb302_i2c_write(chip, FUSB_REG_MASKA, 0xff);
+	if (ret < 0)
+		goto restore;
+	control2 = saved.control2 & ~FUSB_REG_CONTROL2_TOGGLE;
+	ret = fusb302_i2c_write(chip, FUSB_REG_CONTROL2, control2);
+	if (ret < 0)
+		goto restore;
+	ret = fusb302_i2c_mask_write(chip, FUSB_REG_CONTROL0,
+				     FUSB_REG_CONTROL0_HOST_CUR_MASK,
+				     FUSB_REG_CONTROL0_HOST_CUR_DEF);
+	if (ret < 0)
+		goto restore;
+
+	ret = fusb302_orientation_probe_cc(chip, TYPEC_POLARITY_CC1, &cc1);
+	if (ret < 0)
+		goto restore;
+	ret = fusb302_orientation_probe_cc(chip, TYPEC_POLARITY_CC2, &cc2);
+
+restore:
+	restore_ret = fusb302_probe_restore(chip, &saved);
+	if (restore_ret < 0) {
+		dev_err(chip->dev,
+			"failed to restore FUSB302 after CC orientation probe: %d\n",
+			restore_ret);
+		return -EUCLEAN;
+	}
+	if (ret < 0)
+		return ret;
+
+	if (cc1 == TYPEC_CC_RD &&
+	    (cc2 == TYPEC_CC_OPEN || cc2 == TYPEC_CC_RA))
+		*orientation = TYPEC_ORIENTATION_NORMAL;
+	else if (cc2 == TYPEC_CC_RD &&
+		 (cc1 == TYPEC_CC_OPEN || cc1 == TYPEC_CC_RA))
+		*orientation = TYPEC_ORIENTATION_REVERSE;
+	else if (cc1 != TYPEC_CC_OPEN || cc2 != TYPEC_CC_OPEN)
+		fusb302_log(chip, "orientation probe ignored cc1=%s, cc2=%s",
+			    typec_cc_status_name[cc1], typec_cc_status_name[cc2]);
+
+	return 0;
+}
+
+static int fusb302_orientation_probe_update(struct fusb302_chip *chip)
+{
+	enum typec_orientation orientation;
+	bool changed;
+	int ret;
+
+	mutex_lock(&chip->lock);
+	ret = fusb302_orientation_probe_locked(chip, &orientation);
+	mutex_unlock(&chip->lock);
+	if (ret)
+		return ret;
+
+	if (orientation == TYPEC_ORIENTATION_NONE) {
+		/* Open is not a reliable detach signal on this non-standard link. */
+		WRITE_ONCE(chip->probed_orientation, TYPEC_ORIENTATION_NONE);
+		return 0;
+	}
+
+	changed = orientation != READ_ONCE(chip->probed_orientation);
+	if (!changed)
+		return 0;
+
+	ret = typec_switch_set(chip->orientation_sw, orientation);
+	if (ret)
+		return ret;
+
+	WRITE_ONCE(chip->probed_orientation, orientation);
+	dev_info(chip->dev,
+		 "Sink-only CC probe selected local %s orientation\n",
+		 orientation == TYPEC_ORIENTATION_REVERSE ?
+		 "reverse" : "normal");
+
+	return 0;
+}
+
+static void fusb302_orientation_probe_work(struct work_struct *work)
+{
+	struct fusb302_chip *chip =
+		container_of(work, struct fusb302_chip,
+			     orientation_probe_work.work);
+	unsigned int delay = T_ORIENTATION_PROBE_OPEN_MS;
+	int ret;
+
+	ret = fusb302_orientation_probe_update(chip);
+	if (!ret && READ_ONCE(chip->probed_orientation) !=
+	    TYPEC_ORIENTATION_NONE) {
+		delay = T_ORIENTATION_PROBE_PRESENT_MS;
+	} else if (ret == -EAGAIN) {
+		delay = T_ORIENTATION_PROBE_OPEN_MS;
+	} else if (ret == -EPERM) {
+		delay = T_ORIENTATION_PROBE_PRESENT_MS;
+	} else if (ret == -EUCLEAN) {
+		WRITE_ONCE(chip->orientation_probe_enabled, false);
+		return;
+	} else if (ret) {
+		dev_warn_ratelimited(chip->dev,
+				     "Sink-only CC orientation probe failed: %d\n",
+				     ret);
+	}
+
+	if (READ_ONCE(chip->orientation_probe_enabled) &&
+	    !READ_ONCE(chip->orientation_probe_paused))
+		queue_delayed_work(chip->wq, &chip->orientation_probe_work,
+				   msecs_to_jiffies(delay));
+}
+
+static int fusb302_orientation_probe_init(struct fusb302_chip *chip)
+{
+	const char *power_role;
+	int ret;
+
+	if (!device_property_read_bool(chip->dev,
+				       "fcs,sink-cc-orientation-probe"))
+		return 0;
+
+	ret = fwnode_property_read_string(chip->tcpc_dev.fwnode,
+					  "power-role", &power_role);
+	if (ret || strcmp(power_role, "sink"))
+		return dev_err_probe(chip->dev, -EINVAL,
+				     "CC orientation probe requires fixed Sink power role\n");
+
+	chip->orientation_sw =
+		fwnode_typec_switch_get(chip->tcpc_dev.fwnode);
+	if (IS_ERR(chip->orientation_sw))
+		return dev_err_probe(chip->dev, PTR_ERR(chip->orientation_sw),
+				     "cannot get orientation switch for CC probe\n");
+	if (!chip->orientation_sw)
+		return dev_err_probe(chip->dev, -ENODEV,
+				     "CC orientation probe has no orientation switch\n");
+
+	INIT_DELAYED_WORK(&chip->orientation_probe_work,
+			  fusb302_orientation_probe_work);
+	WRITE_ONCE(chip->orientation_probe_enabled, true);
+	WRITE_ONCE(chip->orientation_probe_paused, false);
+	WRITE_ONCE(chip->probed_orientation, TYPEC_ORIENTATION_NONE);
+
+	ret = fusb302_orientation_probe_update(chip);
+	if (ret == -EUCLEAN)
+		goto err_put_switch;
+	if (ret && ret != -EAGAIN)
+		dev_warn(chip->dev,
+			 "initial Sink-only CC orientation probe deferred: %d\n",
+			 ret);
+
+	queue_delayed_work(chip->wq, &chip->orientation_probe_work, 0);
+	dev_warn(chip->dev,
+		 "enabled non-standard Sink-only CC orientation probe; VBUS sourcing remains disabled\n");
+
+	return 0;
+
+err_put_switch:
+	WRITE_ONCE(chip->orientation_probe_enabled, false);
+	WRITE_ONCE(chip->orientation_probe_paused, true);
+	typec_switch_put(chip->orientation_sw);
+	chip->orientation_sw = NULL;
+	return ret;
+}
+
+static void fusb302_orientation_probe_exit(struct fusb302_chip *chip)
+{
+	if (!chip->orientation_sw)
+		return;
+
+	WRITE_ONCE(chip->orientation_probe_enabled, false);
+	WRITE_ONCE(chip->orientation_probe_paused, true);
+	cancel_delayed_work_sync(&chip->orientation_probe_work);
+	typec_switch_put(chip->orientation_sw);
+	chip->orientation_sw = NULL;
+}
+
 static int fusb302_handle_togdone_src(struct fusb302_chip *chip,
 				      u8 togdone_result)
 {
@@ -1730,8 +2039,10 @@ static int fusb302_probe(struct i2c_client *client,
 		return -ENOMEM;
 
 	chip->irq_worker = kthread_create_worker(0, dev_name(dev));
-	if (IS_ERR(chip->irq_worker))
-		return PTR_ERR(chip->irq_worker);
+	if (IS_ERR(chip->irq_worker)) {
+		ret = PTR_ERR(chip->irq_worker);
+		goto destroy_workqueue_only;
+	}
 	sched_set_fifo(chip->irq_worker->task);
 
 	spin_lock_init(&chip->irq_lock);
@@ -1772,13 +2083,26 @@ static int fusb302_probe(struct i2c_client *client,
 	// enable_irq_wake(chip->gpio_int_n_irq);
 	i2c_set_clientdata(client, chip);
 
+	ret = fusb302_orientation_probe_init(chip);
+	if (ret)
+		goto free_irq;
+
 	return ret;
+
+free_irq:
+	/* Stop new work before draining anything that can use tcpm_port. */
+	disable_irq(chip->gpio_int_n_irq);
+	kthread_flush_worker(chip->irq_worker);
+	cancel_delayed_work_sync(&chip->bc_lvl_handler);
+	free_irq(chip->gpio_int_n_irq, chip);
 
 tcpm_unregister_port:
 	tcpm_unregister_port(chip->tcpm_port);
 	fwnode_handle_put(chip->tcpc_dev.fwnode);
 destroy_workqueue:
 	fusb302_debugfs_exit(chip);
+	kthread_destroy_worker(chip->irq_worker);
+destroy_workqueue_only:
 	destroy_workqueue(chip->wq);
 
 	return ret;
@@ -1788,10 +2112,13 @@ static void fusb302_remove(struct i2c_client *client)
 {
 	struct fusb302_chip *chip = i2c_get_clientdata(client);
 
+	fusb302_orientation_probe_exit(chip);
 	disable_irq_wake(chip->gpio_int_n_irq);
+	disable_irq(chip->gpio_int_n_irq);
+	kthread_flush_worker(chip->irq_worker);
+	cancel_delayed_work_sync(&chip->bc_lvl_handler);
 	free_irq(chip->gpio_int_n_irq, chip);
 	kthread_destroy_worker(chip->irq_worker);
-	cancel_delayed_work_sync(&chip->bc_lvl_handler);
 	tcpm_unregister_port(chip->tcpm_port);
 	fwnode_handle_put(chip->tcpc_dev.fwnode);
 	destroy_workqueue(chip->wq);
@@ -1802,6 +2129,12 @@ static int fusb302_pm_suspend(struct device *dev)
 {
 	struct fusb302_chip *chip = dev->driver_data;
 	unsigned long flags;
+
+	if (READ_ONCE(chip->orientation_probe_enabled)) {
+		WRITE_ONCE(chip->orientation_probe_paused, true);
+		WRITE_ONCE(chip->probed_orientation, TYPEC_ORIENTATION_NONE);
+		cancel_delayed_work_sync(&chip->orientation_probe_work);
+	}
 
 	spin_lock_irqsave(&chip->irq_lock, flags);
 	chip->irq_suspended = true;
@@ -1835,6 +2168,12 @@ static int fusb302_pm_resume(struct device *dev)
 	}
 	chip->irq_suspended = false;
 	spin_unlock_irqrestore(&chip->irq_lock, flags);
+
+	if (READ_ONCE(chip->orientation_probe_enabled)) {
+		WRITE_ONCE(chip->probed_orientation, TYPEC_ORIENTATION_NONE);
+		WRITE_ONCE(chip->orientation_probe_paused, false);
+		queue_delayed_work(chip->wq, &chip->orientation_probe_work, 0);
+	}
 
 	return 0;
 }

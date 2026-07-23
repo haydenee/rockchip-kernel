@@ -82,6 +82,27 @@ properties:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: When set, clamp phy output. Only work when usbdpphy power off.
 
+  rockchip,usb-lane-auto-scan:
+    type: boolean
+    description:
+      Enables a board-specific USB-only compatibility scan for a non-standard
+      Type-C link whose complete cable orientation is unavailable. While the
+      PHY is powered and neither USB CDR is locked, the driver may try both
+      documented USB lane mappings and freezes the first mapping which locks.
+      An orientation switch, when present, supplies the initial mapping hint.
+      Without one, a companion connection detector must request a new scan on
+      each insertion. This property must not be combined with DisplayPort Alt
+      Mode and never enables DisplayPort lanes.
+
+  rockchip,usb-lane-scan-link-confirm:
+    type: boolean
+    description:
+      Requires a private companion notification from the same USB controller
+      before a CDR-locked mapping is saved as last-good. The notification must
+      represent a configured direct SuperSpeed child; CDR lock alone remains
+      only a candidate. This is intended for a fixed-host connector without a
+      reliable CC orientation source.
+
   dp-port:
     type: object
     additionalProperties: false
@@ -113,6 +134,10 @@ required:
   - reset-names
   - dp-port
   - u3-port
+
+dependencies:
+  rockchip,usb-lane-scan-link-confirm:
+    - rockchip,usb-lane-auto-scan
 
 additionalProperties: false
 
