@@ -1,0 +1,101 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/usb/embedfire,rk3588-lubancat-5-usb-c-lane-manager.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: EmbedFire LubanCat-5 USB-C SuperSpeed Lane Manager
+
+maintainers:
+  - EmbedFire <embedfire@embedfire.com>
+
+description: |
+  Board-level coordinator for LubanCat-5 USB-C ports. A standards-valid CC
+  orientation, when present, is forwarded to the USB3 PHY. Otherwise, a local
+  FUSB302 CC sample or an attach indication from the paired USB2 PHY starts a
+  bounded two-orientation search which is confirmed by USB SuperSpeed
+  enumeration. A sampled local CC orientation is only the first candidate; it
+  does not describe the orientation at the far end of a Type-C cable.
+
+properties:
+  compatible:
+    const: embedfire,rk3588-lubancat-5-usb-c-lane-manager
+
+  phys:
+    maxItems: 1
+
+  phy-names:
+    items:
+      - const: usb2
+
+  embedfire,usb-controller:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      DWC3 controller whose port 1 is paired with the USB2 PHY and orientation
+      switch.
+
+  orientation-switch:
+    type: boolean
+    description:
+      The manager accepts a standards-based Type-C orientation input.
+
+  port:
+    $ref: /schemas/graph.yaml#/properties/port
+    description: Output to the USB3 PHY when there is no orientation input.
+
+  ports:
+    $ref: /schemas/graph.yaml#/properties/ports
+
+    properties:
+      port@0:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: Output to the USB3 PHY orientation switch.
+
+      port@1:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: Optional input from a Type-C connector.
+
+    required:
+      - port@0
+
+allOf:
+  - if:
+      required:
+        - orientation-switch
+    then:
+      required:
+        - ports
+      properties:
+        port: false
+        ports:
+          required:
+            - port@1
+    else:
+      required:
+        - port
+      properties:
+        ports: false
+
+required:
+  - compatible
+  - phys
+  - phy-names
+  - embedfire,usb-controller
+
+additionalProperties: false
+
+examples:
+  - |
+    usb-c-lane-manager {
+        compatible = "embedfire,rk3588-lubancat-5-usb-c-lane-manager";
+        phys = <&u2phy1_otg>;
+        phy-names = "usb2";
+        embedfire,usb-controller = <&usbdrd_dwc3_1>;
+
+        port {
+            lane_manager_orientation: endpoint {
+                remote-endpoint = <&usbdp_phy1_orientation>;
+            };
+        };
+    };
+...

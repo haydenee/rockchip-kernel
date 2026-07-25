@@ -16,11 +16,13 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
 #include <linux/of_platform.h>
 #include <linux/phy/phy.h>
+#include <linux/phy/phy-rockchip-inno-usb2.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/power_supply.h>
@@ -32,27 +34,13 @@
 #include <linux/usb/otg.h>
 #include <linux/usb/role.h>
 #include <linux/usb/typec_mux.h>
-#include <linux/usb.h>
 #include <linux/wakelock.h>
-#include <linux/workqueue.h>
-
-#include "phy-rockchip-usbdp.h"
 
 #define BIT_WRITEABLE_SHIFT	16
 #define SCHEDULE_DELAY		(60 * HZ)
 #define OTG_SCHEDULE_DELAY	(1 * HZ)
 #define BYPASS_SCHEDULE_DELAY	(2 * HZ)
 #define FILTER_COUNTER		0xF4240
-#define USB3_LANE_SCAN_ARM_MS	2000
-#define USB3_LANE_SCAN_PROBE_MS	5500
-#define USB3_LANE_SCAN_STALE_RECHECK_MS	1500
-#define USB3_LANE_SCAN_STALE_POLL_MS	1000
-#define USB3_LANE_SCAN_CONFIRM_RETRY_MS	50
-#define USB3_LANE_SCAN_CONFIRM_RETRIES	20
-
-#define USB3_LANE_SCAN_PENDING_BEGIN	BIT(0)
-#define USB3_LANE_SCAN_PENDING_END	BIT(1)
-#define USB3_LANE_SCAN_PENDING_CONFIRM	BIT(2)
 
 struct rockchip_usb2phy;
 
@@ -68,13 +56,6 @@ enum rockchip_usb2phy_host_state {
 	PHY_STATE_CONNECT	= 2,
 	PHY_STATE_FS_LS_ONLINE	= 4,
 	PHY_STATE_SE1		= 6,
-};
-
-enum rockchip_usb2phy_lane_scan_trigger_state {
-	USB3_LANE_SCAN_TRIGGER_OFF,
-	USB3_LANE_SCAN_TRIGGER_WAIT_RISE,
-	USB3_LANE_SCAN_TRIGGER_WAIT_FALL,
-	USB3_LANE_SCAN_TRIGGER_PROBING,
 };
 
 /**
@@ -281,17 +262,12 @@ struct rockchip_usb2phy_cfg {
  * @vbus_enabled: vbus regulator status.
  * @bypass_uart_en: usb bypass uart enable, passed from DT.
  * @host_disconnect: usb host disconnect status.
- * @usb3_lane_scan_enabled: trigger companion USB3 lane scan from linestate.
- * @usb3_lane_scan_initialized: companion reference is valid for this init.
- * @usb3_lane_scan_trigger_state: raw-edge arming/probe state.
- * @usb3_lane_scan_trigger_deadline: arming or bounded-probe deadline.
- * @usb3_lane_scan_generation: current packed companion attach generation.
- * @usb3_lane_scan_pending_events: BEGIN/END/CONFIRM events awaiting delivery.
- * @usb3_lane_scan_confirm_retries: bounded transient confirmation retries.
- * @usb3_lane_scan_resume_probe: system sleep interrupted a bounded probe.
- * @usb3_lane_scan_suspended: system sleep gate for scan trigger work.
- * @usb3_lane_scan_tearing_down: permanent teardown gate for scan work.
- * @usb3_lane_scan_usb_nb_registered: USB core notifier is registered.
+ * @host_ls_nb: consumer owning one-shot linestate activity detection.
+ * @host_ls_armed: one-shot linestate activity detection is armed.
+ * @host_ls_ack_pending: a reported activity still needs acknowledgment.
+ * @host_ls_saved_enabled: linestate IRQ state before notifier ownership.
+ * @host_ls_saved_valid: saved linestate IRQ state is valid.
+ * @initialized: the PHY consumer has initialized this port.
  * @dis_u2_susphy: disable usb2 phy suspend.
  * @bvalid_irq: IRQ number assigned for vbus valid rise detection.
  * @id_irq: IRQ number assigned for id fall or rise detection.
@@ -299,25 +275,19 @@ struct rockchip_usb2phy_cfg {
  * @otg_mux_irq: IRQ number which multiplex otg-id/otg-bvalid/linestate
  *		 irqs to one irq in otg-port.
  * @mutex: for register updating in sm_work.
- * @usb3_lane_scan_bridge_mutex: serializes packed companion PHY calls.
+ * @host_ls_dispatch_lock: serializes callbacks with control operations.
  * @chg_work: charge detect work.
  * @bypass_uart_work: usb bypass uart work.
  * @otg_sm_work: OTG state machine work.
  * @sm_work: HOST state machine work.
- * @usb3_lane_scan_work: companion USB3 lane scan request work.
- * @usb3_lane_scan_probe_work: bounded raw-edge probe timeout work.
- * @usb3_lane_scan_stale_work: delayed direct-child removal recheck.
- * @usb3_lane_scan_phy: companion USB3 PHY held from U2 init to U2 exit.
- * @usb3_lane_scan_controller: DWC3 device consuming the paired U2/U3 PHYs.
- * @usb3_lane_scan_usb2_dev: direct child on the controller's USB2 root hub.
- * @usb3_lane_scan_usb3_dev: direct child on the controller's USB3 root hub.
- * @usb3_lane_scan_usb_nb: same-controller direct-child notifier.
+ * @host_ls_notifier: one-shot linestate activity observer.
  * @vbus: vbus regulator supply on few rockchip boards.
  * @sw: orientation switch, communicate with TCPM (Type-C Port Manager).
  * @port_cfg: port register configuration, assigned by driver data.
  * @event_nb: hold event notification callback.
  * @gpio_vbus_nb: hold extcon usb gpio vbus notification callback.
  * @gpio_id_nb: hold extcon usb gpio id notification callback.
+ * @wakelock: suspend blocker used while an OTG peripheral is active.
  * @state: define OTG enumeration states before device reset.
  * @mode: the dr_mode of the controller.
  */
@@ -338,40 +308,28 @@ struct rockchip_usb2phy_port {
 	bool		vbus_enabled;
 	bool		bypass_uart_en;
 	bool		host_disconnect;
-	bool		usb3_lane_scan_enabled;
-	bool		usb3_lane_scan_initialized;
-	bool		usb3_lane_scan_resume_probe;
-	bool		usb3_lane_scan_suspended;
-	bool		usb3_lane_scan_tearing_down;
-	bool		usb3_lane_scan_usb_nb_registered;
-	u8		usb3_lane_scan_confirm_retries;
-	enum rockchip_usb2phy_lane_scan_trigger_state usb3_lane_scan_trigger_state;
-	unsigned long	usb3_lane_scan_trigger_deadline;
-	u32		usb3_lane_scan_generation;
-	u32		usb3_lane_scan_pending_events;
+	bool		host_ls_armed;
+	bool		host_ls_ack_pending;
+	bool		host_ls_saved_enabled;
+	bool		host_ls_saved_valid;
+	bool		initialized;
 	bool		dis_u2_susphy;
 	int		bvalid_irq;
 	int		id_irq;
 	int		ls_irq;
 	int		otg_mux_irq;
 	struct mutex	mutex;
-	struct mutex	usb3_lane_scan_bridge_mutex; /* serializes U3 calls */
+	struct mutex	host_ls_dispatch_lock; /* serializes consumer callbacks */
 	struct		delayed_work bypass_uart_work;
 	struct		delayed_work chg_work;
 	struct		delayed_work otg_sm_work;
 	struct		delayed_work sm_work;
-	struct		delayed_work usb3_lane_scan_work;
-	struct		delayed_work usb3_lane_scan_probe_work;
-	struct		delayed_work usb3_lane_scan_stale_work;
-	struct phy	*usb3_lane_scan_phy;
-	struct device	*usb3_lane_scan_controller;
-	struct usb_device *usb3_lane_scan_usb2_dev;
-	struct usb_device *usb3_lane_scan_usb3_dev;
 	struct		regulator *vbus;
 	struct		typec_switch_dev *sw;
 	const struct	rockchip_usb2phy_port_cfg *port_cfg;
 	struct notifier_block	event_nb;
-	struct notifier_block	usb3_lane_scan_usb_nb;
+	struct notifier_block	*host_ls_nb;
+	struct blocking_notifier_head host_ls_notifier;
 	struct notifier_block	gpio_vbus_nb;
 	struct notifier_block	gpio_id_nb;
 	struct wake_lock	wakelock;
@@ -385,7 +343,7 @@ struct rockchip_usb2phy_port {
  * @grf: General Register Files regmap.
  * @usbgrf: USB General Register Files regmap.
  * @usbctrl_grf: USB Controller General Register Files regmap.
- * *phy_base: the base address of USB PHY.
+ * @phy_base: the base address of USB PHY.
  * @phy_reset: phy reset control.
  * @clks: array of phy input clocks.
  * @clk480m: clock struct of phy output clk.
@@ -427,6 +385,8 @@ struct rockchip_usb2phy {
 	const struct rockchip_usb2phy_cfg	*phy_cfg;
 	struct rockchip_usb2phy_port	ports[USB2PHY_NUM_PORTS];
 };
+
+static const struct phy_ops rockchip_usb2phy_ops;
 
 static inline struct regmap *get_reg_base(struct rockchip_usb2phy *rphy)
 {
@@ -777,6 +737,12 @@ out:
 	return ret;
 }
 
+static int host_ls_set_irq(struct rockchip_usb2phy *rphy,
+			   struct rockchip_usb2phy_port *rport, bool en)
+{
+	return property_enable(rphy->grf, &rport->port_cfg->ls_det_en, en);
+}
+
 static int rockchip_usb2phy_enable_host_disc_irq(struct rockchip_usb2phy *rphy,
 						 struct rockchip_usb2phy_port *rport,
 						 bool en)
@@ -800,778 +766,294 @@ out:
 	return ret;
 }
 
-static int
-rockchip_usb2phy_host_disc_irq_snapshot(struct rockchip_usb2phy *rphy,
-					struct rockchip_usb2phy_port *rport,
-					bool *fall, bool *rise)
+static struct rockchip_usb2phy_port *
+rockchip_usb2phy_host_ls_port(struct phy *phy)
 {
-	const struct usb2phy_reg *fall_st = &rport->port_cfg->disfall_st;
-	const struct usb2phy_reg *rise_st = &rport->port_cfg->disrise_st;
-	unsigned int fall_val, rise_val;
+	struct rockchip_usb2phy_port *rport;
+
+	if (!phy || phy->ops != &rockchip_usb2phy_ops)
+		return NULL;
+	rport = phy_get_drvdata(phy);
+
+	return rport && rport->phy == phy ? rport : NULL;
+}
+
+static int
+rockchip_usb2phy_host_ls_pending(struct rockchip_usb2phy *rphy,
+				 struct rockchip_usb2phy_port *rport,
+				 bool *pending)
+{
+	const struct usb2phy_reg *status = &rport->port_cfg->ls_det_st;
+	unsigned int value;
 	int ret;
 
-	ret = regmap_read(rphy->grf, fall_st->offset, &fall_val);
-	if (ret)
-		return ret;
-
-	if (fall_st->offset == rise_st->offset) {
-		rise_val = fall_val;
-	} else {
-		ret = regmap_read(rphy->grf, rise_st->offset, &rise_val);
-		if (ret)
-			return ret;
-	}
-
-	*fall = property_value_enabled(fall_val, fall_st);
-	*rise = property_value_enabled(rise_val, rise_st);
-
-	return 0;
+	ret = regmap_read(rphy->grf, status->offset, &value);
+	if (!ret)
+		*pending = property_value_enabled(value, status);
+	return ret;
 }
 
-static struct phy *
-rockchip_usb2phy_get_usb3_lane_scan_phy(struct rockchip_usb2phy_port *rport,
-					struct device **controller_dev)
+static int
+rockchip_usb2phy_host_ls_ack(struct rockchip_usb2phy *rphy,
+			     struct rockchip_usb2phy_port *rport)
 {
-	struct device_node *controller = NULL;
-	struct device_node *found = NULL;
-	struct device_node *phy_np = rport->phy->dev.of_node;
-	struct platform_device *controller_pdev;
-	struct of_phandle_args args;
-	struct phy *phy;
-	bool match;
-	int index, ret;
-
-	/*
-	 * Reuse the U3 PHY already owned by the controller which consumes this
-	 * U2 PHY. DWC3 obtains both PHYs before it invokes U2 .init(), so this
-	 * lookup cannot introduce a provider probe dependency.
-	 */
-	while ((controller =
-		of_find_node_with_property(controller, "phys"))) {
-		if (!of_device_is_available(controller))
-			continue;
-		index = of_property_match_string(controller, "phy-names",
-						 "usb2-phy");
-		if (index < 0 ||
-		    of_property_match_string(controller, "phy-names",
-					     "usb3-phy") < 0)
-			continue;
-
-		/*
-		 * phy_init() already holds rport->phy->mutex, so obtaining the
-		 * same PHY here would deadlock in of_phy_put().  This opt-in is
-		 * fail-closed to the zero-cell provider used by these SoCs.
-		 */
-		ret = of_parse_phandle_with_args(controller, "phys", "#phy-cells",
-						 index, &args);
-		if (ret)
-			continue;
-		match = args.np == phy_np && args.args_count == 0;
-		of_node_put(args.np);
-		if (!match)
-			continue;
-
-		if (found) {
-			of_node_put(found);
-			of_node_put(controller);
-			return ERR_PTR(-EINVAL);
-		}
-		found = of_node_get(controller);
-	}
-
-	if (!found)
-		return ERR_PTR(-ENODEV);
-
-	phy = of_phy_get(found, "usb3-phy");
-	if (IS_ERR(phy)) {
-		of_node_put(found);
-		return phy;
-	}
-
-	controller_pdev = of_find_device_by_node(found);
-	of_node_put(found);
-	if (!controller_pdev) {
-		of_phy_put(phy);
-		return ERR_PTR(-EPROBE_DEFER);
-	}
-
-	*controller_dev = &controller_pdev->dev;
-	return phy;
+	return property_enable(rphy->grf, &rport->port_cfg->ls_det_clr, true);
 }
 
-static bool rockchip_usb2phy_usb3_lane_scan_phy_supported(struct phy *phy)
+int
+rockchip_usb2phy_register_host_ls_activity_notifier(struct phy *phy, struct notifier_block *nb)
 {
-	struct device *provider = phy->dev.parent;
-	struct device_node *np = provider ? provider->of_node : NULL;
+	struct rockchip_usb2phy_port *rport;
+	struct rockchip_usb2phy *rphy;
+	unsigned int value;
+	int ret;
 
-	if (!np ||
-	    (!of_device_is_compatible(np, "rockchip,rk3576-usbdp-phy") &&
-	     !of_device_is_compatible(np, "rockchip,rk3588-usbdp-phy")))
-		return false;
+	if (!phy || !nb)
+		return -EINVAL;
+	rport = rockchip_usb2phy_host_ls_port(phy);
+	if (!rport)
+		return -ENODEV;
+	if (rport->port_id != USB2PHY_PORT_OTG ||
+	    !rport->port_cfg->ls_det_en.offset ||
+	    !rport->port_cfg->ls_det_st.offset ||
+	    !rport->port_cfg->ls_det_clr.offset)
+		return -EOPNOTSUPP;
+	rphy = dev_get_drvdata(phy->dev.parent);
+	if (rphy->irq <= 0 && rport->otg_mux_irq <= 0 && rport->ls_irq <= 0)
+		return -EOPNOTSUPP;
 
-	return of_property_read_bool(np, "rockchip,usb-lane-auto-scan") &&
-	       of_property_read_bool(np,
-				     "rockchip,usb-lane-scan-link-confirm") &&
-	       phy->ops->set_mode;
-}
-
-/* The caller must hold rport->mutex. */
-static bool
-rockchip_usb2phy_usb3_lane_scan_direct_present(struct rockchip_usb2phy_port *rport)
-{
-	return rport->usb3_lane_scan_usb2_dev ||
-	       rport->usb3_lane_scan_usb3_dev;
-}
-
-/* The caller must hold rport->mutex. */
-static bool
-rockchip_usb2phy_usb3_lane_scan_confirmable_ss(struct rockchip_usb2phy_port *rport)
-{
-#if IS_REACHABLE(CONFIG_USB)
-	struct usb_device *udev = rport->usb3_lane_scan_usb3_dev;
-	enum usb_device_state state;
-
-	if (!udev || udev->speed < USB_SPEED_SUPER ||
-	    !READ_ONCE(udev->actconfig))
-		return false;
-
-	state = READ_ONCE(udev->state);
-	return state == USB_STATE_CONFIGURED || state == USB_STATE_SUSPENDED;
-#else
-	return false;
-#endif
-}
-
-/* The caller must hold rport->mutex. */
-static void
-rockchip_usb2phy_usb3_lane_scan_queue(struct rockchip_usb2phy_port *rport,
-				      unsigned long delay)
-{
-	if (!rport->usb3_lane_scan_initialized ||
-	    rport->usb3_lane_scan_suspended ||
-	    rport->usb3_lane_scan_tearing_down ||
-	    !rport->usb3_lane_scan_pending_events)
-		return;
-
-	mod_delayed_work(system_freezable_wq,
-			 &rport->usb3_lane_scan_work, delay);
-}
-
-/* The caller must hold rport->mutex. */
-static u32
-rockchip_usb2phy_usb3_lane_scan_next_generation(struct rockchip_usb2phy_port *rport)
-{
-	rport->usb3_lane_scan_generation =
-		(rport->usb3_lane_scan_generation + 1) &
-		ROCKCHIP_UDPHY_USB_LANE_SCAN_GENERATION_MASK;
-
-	return rport->usb3_lane_scan_generation;
-}
-
-/* The caller must hold rport->mutex. */
-static void
-rockchip_usb2phy_lane_scan_new_events(struct rockchip_usb2phy_port *rport, u32 events)
-{
-	/* Producers always acquire rport->mutex before the bridge lock. */
-	mutex_lock(&rport->usb3_lane_scan_bridge_mutex);
-	rockchip_usb2phy_usb3_lane_scan_next_generation(rport);
-	rport->usb3_lane_scan_pending_events = events;
-	rport->usb3_lane_scan_confirm_retries = 0;
-	mutex_unlock(&rport->usb3_lane_scan_bridge_mutex);
-}
-
-/* The caller must hold rport->mutex. */
-static void
-rockchip_usb2phy_lane_scan_end(struct rockchip_usb2phy_port *rport)
-{
-	rockchip_usb2phy_lane_scan_new_events(rport, USB3_LANE_SCAN_PENDING_END);
-}
-
-/* The caller must hold rport->mutex. */
-static void
-rockchip_usb2phy_usb3_lane_scan_start_probe(struct rockchip_usb2phy_port *rport)
-{
-	struct rockchip_usb2phy *rphy =
-		dev_get_drvdata(rport->phy->dev.parent);
-
-	if (!rport->usb3_lane_scan_initialized ||
-	    rport->usb3_lane_scan_suspended ||
-	    rport->usb3_lane_scan_tearing_down ||
-	    rockchip_usb2phy_usb3_lane_scan_direct_present(rport))
-		return;
-
-	rport->usb3_lane_scan_trigger_state =
-		USB3_LANE_SCAN_TRIGGER_PROBING;
-	rport->usb3_lane_scan_trigger_deadline =
-		jiffies + msecs_to_jiffies(USB3_LANE_SCAN_PROBE_MS);
-	rockchip_usb2phy_lane_scan_new_events(rport, USB3_LANE_SCAN_PENDING_BEGIN);
-	rockchip_usb2phy_enable_line_irq(rphy, rport, false);
-	mod_delayed_work(system_freezable_wq,
-			 &rport->usb3_lane_scan_probe_work,
-			 msecs_to_jiffies(USB3_LANE_SCAN_PROBE_MS));
-	rockchip_usb2phy_usb3_lane_scan_queue(rport, 0);
-}
-
-static void
-rockchip_usb2phy_usb3_lane_scan_probe_work(struct work_struct *work)
-{
-	struct rockchip_usb2phy_port *rport =
-		container_of(work, struct rockchip_usb2phy_port,
-			     usb3_lane_scan_probe_work.work);
-	struct rockchip_usb2phy *rphy =
-		dev_get_drvdata(rport->phy->dev.parent);
-	unsigned long delay, now;
-
+	mutex_lock(&rport->host_ls_dispatch_lock);
 	mutex_lock(&rport->mutex);
-	if (!rport->usb3_lane_scan_initialized ||
-	    rport->usb3_lane_scan_suspended ||
-	    rport->usb3_lane_scan_tearing_down)
+	if (rport->host_ls_nb) {
+		ret = -EBUSY;
 		goto unlock;
+	}
+	if (rport->host_ls_saved_valid) {
+		ret = host_ls_set_irq(rphy, rport,
+				      rport->host_ls_saved_enabled);
+		if (ret)
+			goto unlock;
+		rport->host_ls_saved_valid = false;
+	}
+	ret = regmap_read(rphy->grf, rport->port_cfg->ls_det_en.offset,
+			  &value);
+	if (ret)
+		goto unlock;
+	rport->host_ls_saved_enabled =
+		property_value_enabled(value, &rport->port_cfg->ls_det_en);
+	rport->host_ls_saved_valid = true;
+	ret = host_ls_set_irq(rphy, rport, false);
+	if (ret) {
+		int restore_ret;
 
-	now = jiffies;
-	switch (rport->usb3_lane_scan_trigger_state) {
-	case USB3_LANE_SCAN_TRIGGER_WAIT_FALL:
-		if (time_before(now, rport->usb3_lane_scan_trigger_deadline)) {
-			delay = rport->usb3_lane_scan_trigger_deadline - now;
-			mod_delayed_work(system_freezable_wq,
-					 &rport->usb3_lane_scan_probe_work,
-					 delay);
-			break;
-		}
-		rport->usb3_lane_scan_trigger_state =
-			USB3_LANE_SCAN_TRIGGER_WAIT_RISE;
-		break;
-	case USB3_LANE_SCAN_TRIGGER_PROBING:
-		if (time_before(now, rport->usb3_lane_scan_trigger_deadline)) {
-			delay = rport->usb3_lane_scan_trigger_deadline - now;
-			mod_delayed_work(system_freezable_wq,
-					 &rport->usb3_lane_scan_probe_work,
-					 delay);
-			break;
-		}
-		rport->usb3_lane_scan_trigger_state =
-			USB3_LANE_SCAN_TRIGGER_WAIT_RISE;
-		rockchip_usb2phy_lane_scan_end(rport);
-		rockchip_usb2phy_enable_line_irq(rphy, rport, true);
-		rockchip_usb2phy_usb3_lane_scan_queue(rport, 0);
-		break;
-	default:
-		break;
+		restore_ret = host_ls_set_irq(rphy, rport,
+					      rport->host_ls_saved_enabled);
+		if (!restore_ret)
+			rport->host_ls_saved_valid = false;
+		else
+			ret = restore_ret;
+		goto unlock;
+	}
+
+	ret = blocking_notifier_chain_register(&rport->host_ls_notifier, nb);
+	if (!ret) {
+		WRITE_ONCE(rport->host_ls_nb, nb);
+	} else {
+		int restore_ret;
+
+		restore_ret = host_ls_set_irq(rphy, rport,
+					      rport->host_ls_saved_enabled);
+		if (!restore_ret)
+			rport->host_ls_saved_valid = false;
+		else
+			ret = restore_ret;
 	}
 
 unlock:
 	mutex_unlock(&rport->mutex);
+	mutex_unlock(&rport->host_ls_dispatch_lock);
+	return ret;
 }
+EXPORT_SYMBOL_GPL(rockchip_usb2phy_register_host_ls_activity_notifier);
 
-static void rockchip_usb2phy_usb3_lane_scan_work(struct work_struct *work)
+int rockchip_usb2phy_arm_host_ls_activity(struct phy *phy)
 {
-	struct rockchip_usb2phy_port *rport =
-		container_of(work, struct rockchip_usb2phy_port,
-			     usb3_lane_scan_work.work);
-	struct phy *phy;
-	enum rockchip_udphy_usb_lane_scan_event event;
-	unsigned long queue_delay = 0;
-	u32 generation;
-	int submode;
-	int ret;
+	struct rockchip_usb2phy_port *rport;
+	struct rockchip_usb2phy *rphy;
+	bool notify = false, pending;
+	int ret = 0;
 
-	mutex_lock(&rport->mutex);
-	if (!rport->usb3_lane_scan_initialized ||
-	    !rport->usb3_lane_scan_pending_events ||
-	    rport->usb3_lane_scan_suspended ||
-	    rport->usb3_lane_scan_tearing_down) {
-		mutex_unlock(&rport->mutex);
-		return;
-	}
-	phy = rport->usb3_lane_scan_phy;
-	mutex_lock(&rport->usb3_lane_scan_bridge_mutex);
-	generation = rport->usb3_lane_scan_generation;
-	if (rport->usb3_lane_scan_pending_events &
-	    USB3_LANE_SCAN_PENDING_BEGIN) {
-		rport->usb3_lane_scan_pending_events &=
-			~USB3_LANE_SCAN_PENDING_BEGIN;
-		event = ROCKCHIP_UDPHY_USB_LANE_SCAN_ATTACH_BEGIN;
-	} else if (rport->usb3_lane_scan_pending_events &
-		   USB3_LANE_SCAN_PENDING_CONFIRM) {
-		rport->usb3_lane_scan_pending_events &=
-			~USB3_LANE_SCAN_PENDING_CONFIRM;
-		event = ROCKCHIP_UDPHY_USB_LANE_SCAN_LINK_CONFIRMED;
-	} else {
-		rport->usb3_lane_scan_pending_events &=
-			~USB3_LANE_SCAN_PENDING_END;
-		event = ROCKCHIP_UDPHY_USB_LANE_SCAN_ATTACH_END;
-	}
-	submode = rockchip_udphy_usb_lane_scan_submode(event, generation);
-	mutex_unlock(&rport->mutex);
+	rport = rockchip_usb2phy_host_ls_port(phy);
+	if (!rport)
+		return -ENODEV;
+	rphy = dev_get_drvdata(phy->dev.parent);
 
-	/* Never hold the U2 port lock across a companion PHY operation. */
-	ret = phy_set_mode_ext(phy, PHY_MODE_USB_HOST, submode);
-	mutex_unlock(&rport->usb3_lane_scan_bridge_mutex);
+	mutex_lock(&rport->host_ls_dispatch_lock);
 	mutex_lock(&rport->mutex);
-	if (generation == rport->usb3_lane_scan_generation && ret &&
-	    event == ROCKCHIP_UDPHY_USB_LANE_SCAN_ATTACH_BEGIN)
-		rport->usb3_lane_scan_pending_events &=
-			~USB3_LANE_SCAN_PENDING_CONFIRM;
-	if (generation == rport->usb3_lane_scan_generation && ret &&
-	    event == ROCKCHIP_UDPHY_USB_LANE_SCAN_LINK_CONFIRMED) {
-		if ((ret == -EAGAIN || ret == -ENOLINK) &&
-		    rockchip_usb2phy_usb3_lane_scan_confirmable_ss(rport) &&
-		    rport->usb3_lane_scan_confirm_retries <
-			USB3_LANE_SCAN_CONFIRM_RETRIES) {
-			rport->usb3_lane_scan_confirm_retries++;
-			rport->usb3_lane_scan_pending_events |=
-				USB3_LANE_SCAN_PENDING_CONFIRM;
-			queue_delay =
-				msecs_to_jiffies(USB3_LANE_SCAN_CONFIRM_RETRY_MS);
-		} else {
-			/* A failed confirmation must not leave a stale candidate. */
-			rockchip_usb2phy_lane_scan_end(rport);
+	if (!rport->host_ls_nb) {
+		ret = -ENOENT;
+		goto unlock;
+	}
+	if (rport->host_ls_ack_pending) {
+		ret = rockchip_usb2phy_host_ls_ack(rphy, rport);
+		if (ret)
+			goto unlock;
+		rport->host_ls_ack_pending = false;
+	}
+
+	if (!rport->host_ls_armed) {
+		rport->host_ls_armed = true;
+		if (rport->initialized) {
+			ret = host_ls_set_irq(rphy, rport, true);
+			if (ret)
+				goto fail_arm;
 		}
 	}
-	if (!ret && event == ROCKCHIP_UDPHY_USB_LANE_SCAN_LINK_CONFIRMED)
-		rport->usb3_lane_scan_confirm_retries = 0;
-	if (rport->usb3_lane_scan_pending_events &
-	    ~USB3_LANE_SCAN_PENDING_CONFIRM)
-		queue_delay = 0;
-	rockchip_usb2phy_usb3_lane_scan_queue(rport, queue_delay);
-	mutex_unlock(&rport->mutex);
+	ret = rockchip_usb2phy_host_ls_pending(rphy, rport, &pending);
 	if (ret) {
 		dev_warn_ratelimited(&rport->phy->dev,
-				     "companion USB3 lane scan request failed: %d\n",
+				     "failed to sample host linestate activity: %d\n",
 				     ret);
+		ret = 0;
+		goto unlock;
 	}
-}
-
-/* The caller must hold rport->mutex. */
-static void
-rockchip_usb2phy_usb3_lane_scan_disconnected(struct rockchip_usb2phy_port *rport)
-{
-	struct rockchip_usb2phy *rphy =
-		dev_get_drvdata(rport->phy->dev.parent);
-
-	cancel_delayed_work(&rport->usb3_lane_scan_probe_work);
-	rport->usb3_lane_scan_trigger_state =
-		USB3_LANE_SCAN_TRIGGER_WAIT_RISE;
-	rockchip_usb2phy_lane_scan_end(rport);
-	rockchip_usb2phy_enable_line_irq(rphy, rport, true);
-	rockchip_usb2phy_usb3_lane_scan_queue(rport, 0);
-}
-
-#if IS_REACHABLE(CONFIG_USB)
-static bool
-rockchip_usb2phy_usb3_lane_scan_bus_matches(struct rockchip_usb2phy_port *rport,
-					    struct usb_bus *bus)
-{
-	struct device *dev;
-
-	if (!bus || !bus->controller || !rport->usb3_lane_scan_controller)
-		return false;
-
-	for (dev = bus->controller; dev; dev = dev->parent) {
-		if (dev == rport->usb3_lane_scan_controller)
-			return true;
-	}
-
-	return false;
-}
-
-static bool
-rockchip_usb2phy_usb3_lane_scan_device_matches(struct rockchip_usb2phy_port *rport,
-					       struct usb_device *udev)
-{
-	return udev && udev->bus && udev->parent == udev->bus->root_hub &&
-	       udev->level == 1 && udev->portnum == 1 &&
-	       rockchip_usb2phy_usb3_lane_scan_bus_matches(rport, udev->bus);
-}
-
-static void
-rockchip_usb2phy_usb3_lane_scan_device_add(struct rockchip_usb2phy_port *rport,
-					   struct usb_device *udev)
-{
-	struct rockchip_usb2phy *rphy =
-		dev_get_drvdata(rport->phy->dev.parent);
-	struct usb_device **other_slot, **slot;
-	struct usb_device *new, *put_other = NULL, *put_slot = NULL;
-	enum usb_device_state state;
-	bool configured, probing, same_slot, superspeed;
-	u32 events;
-
-	if (!rockchip_usb2phy_usb3_lane_scan_device_matches(rport, udev))
-		return;
-
-	superspeed = udev->speed >= USB_SPEED_SUPER;
-	new = usb_get_dev(udev);
-	mutex_lock(&rport->mutex);
-	state = READ_ONCE(udev->state);
-	if (!rport->usb3_lane_scan_initialized ||
-	    rport->usb3_lane_scan_tearing_down ||
-	    state == USB_STATE_NOTATTACHED) {
-		mutex_unlock(&rport->mutex);
-		usb_put_dev(new);
-		return;
-	}
-	configured = state == USB_STATE_CONFIGURED;
-
-	slot = superspeed ? &rport->usb3_lane_scan_usb3_dev :
-			    &rport->usb3_lane_scan_usb2_dev;
-	other_slot = superspeed ? &rport->usb3_lane_scan_usb2_dev :
-				 &rport->usb3_lane_scan_usb3_dev;
-	same_slot = *slot == udev;
-	if (same_slot) {
-		put_slot = new;
-	} else {
-		put_slot = *slot;
-		*slot = new;
-	}
-	new = NULL;
-
-	/* A seed can see the device before its final speed is known. */
-	if (*other_slot == udev) {
-		put_other = *other_slot;
-		*other_slot = NULL;
-	}
-
-	if (!rport->usb3_lane_scan_suspended)
-		rockchip_usb2phy_enable_line_irq(rphy, rport, false);
-	if (!rport->usb3_lane_scan_suspended &&
-	    !READ_ONCE(udev->dev.driver))
-		mod_delayed_work(system_freezable_wq,
-				 &rport->usb3_lane_scan_stale_work,
-				 msecs_to_jiffies(USB3_LANE_SCAN_STALE_POLL_MS));
-
-	if (!rport->usb3_lane_scan_suspended && superspeed && configured) {
-		probing = rport->usb3_lane_scan_trigger_state ==
-			  USB3_LANE_SCAN_TRIGGER_PROBING;
-		cancel_delayed_work(&rport->usb3_lane_scan_probe_work);
-		rport->usb3_lane_scan_trigger_state =
-			USB3_LANE_SCAN_TRIGGER_WAIT_RISE;
-		if (probing &&
-		    !(rport->usb3_lane_scan_pending_events &
-		      USB3_LANE_SCAN_PENDING_END)) {
-			/* Preserve a pending BEGIN from this raw attach generation. */
-			rport->usb3_lane_scan_pending_events |=
-				USB3_LANE_SCAN_PENDING_CONFIRM;
-				rport->usb3_lane_scan_confirm_retries = 0;
-			} else {
-				events = USB3_LANE_SCAN_PENDING_BEGIN |
-					 USB3_LANE_SCAN_PENDING_CONFIRM;
-				rockchip_usb2phy_lane_scan_new_events(rport, events);
-		}
-		rockchip_usb2phy_usb3_lane_scan_queue(rport, 0);
-	}
-	mutex_unlock(&rport->mutex);
-
-	if (put_slot)
-		usb_put_dev(put_slot);
-	if (put_other)
-		usb_put_dev(put_other);
-}
-
-static void
-rockchip_usb2phy_usb3_lane_scan_device_remove(struct rockchip_usb2phy_port *rport,
-					      struct usb_device *udev)
-{
-	struct usb_device *usb2 = NULL, *usb3 = NULL;
-	enum usb_device_state state;
-
-	if (!rockchip_usb2phy_usb3_lane_scan_device_matches(rport, udev))
-		return;
-
-	mutex_lock(&rport->mutex);
-	state = READ_ONCE(udev->state);
-	if (state != USB_STATE_NOTATTACHED) {
-		if (rport->usb3_lane_scan_initialized &&
-		    !rport->usb3_lane_scan_suspended &&
-		    !rport->usb3_lane_scan_tearing_down &&
-		    (rport->usb3_lane_scan_usb2_dev == udev ||
-		     rport->usb3_lane_scan_usb3_dev == udev))
-			mod_delayed_work(system_freezable_wq,
-					 &rport->usb3_lane_scan_stale_work,
-					 msecs_to_jiffies(USB3_LANE_SCAN_STALE_RECHECK_MS));
-		mutex_unlock(&rport->mutex);
-		return;
-	}
-
-	if (rport->usb3_lane_scan_usb2_dev == udev) {
-		usb2 = rport->usb3_lane_scan_usb2_dev;
-		rport->usb3_lane_scan_usb2_dev = NULL;
-	}
-	if (rport->usb3_lane_scan_usb3_dev == udev) {
-		usb3 = rport->usb3_lane_scan_usb3_dev;
-		rport->usb3_lane_scan_usb3_dev = NULL;
-	}
-	if ((usb2 || usb3) &&
-	    !rockchip_usb2phy_usb3_lane_scan_direct_present(rport) &&
-	    rport->usb3_lane_scan_initialized &&
-	    !rport->usb3_lane_scan_suspended &&
-	    !rport->usb3_lane_scan_tearing_down)
-		rockchip_usb2phy_usb3_lane_scan_disconnected(rport);
-	mutex_unlock(&rport->mutex);
-
-	if (usb2)
-		usb_put_dev(usb2);
-	if (usb3)
-		usb_put_dev(usb3);
-}
-
-static void
-rockchip_usb2phy_usb3_lane_scan_bus_remove(struct rockchip_usb2phy_port *rport,
-					   struct usb_bus *bus)
-{
-	struct usb_device *usb2 = NULL, *usb3 = NULL;
-
-	if (!rockchip_usb2phy_usb3_lane_scan_bus_matches(rport, bus))
-		return;
-
-	mutex_lock(&rport->mutex);
-	if (rport->usb3_lane_scan_usb2_dev &&
-	    rport->usb3_lane_scan_usb2_dev->bus == bus) {
-		usb2 = rport->usb3_lane_scan_usb2_dev;
-		rport->usb3_lane_scan_usb2_dev = NULL;
-	}
-	if (rport->usb3_lane_scan_usb3_dev &&
-	    rport->usb3_lane_scan_usb3_dev->bus == bus) {
-		usb3 = rport->usb3_lane_scan_usb3_dev;
-		rport->usb3_lane_scan_usb3_dev = NULL;
-	}
-	if ((usb2 || usb3) &&
-	    !rockchip_usb2phy_usb3_lane_scan_direct_present(rport) &&
-	    rport->usb3_lane_scan_initialized &&
-	    !rport->usb3_lane_scan_suspended &&
-	    !rport->usb3_lane_scan_tearing_down)
-		rockchip_usb2phy_usb3_lane_scan_disconnected(rport);
-	mutex_unlock(&rport->mutex);
-
-	if (usb2)
-		usb_put_dev(usb2);
-	if (usb3)
-		usb_put_dev(usb3);
-}
-
-static int
-rockchip_usb2phy_usb3_lane_scan_usb_notify(struct notifier_block *nb,
-					   unsigned long action, void *data)
-{
-	struct rockchip_usb2phy_port *rport =
-		container_of(nb, struct rockchip_usb2phy_port,
-			     usb3_lane_scan_usb_nb);
-
-	switch (action) {
-	case USB_DEVICE_ADD:
-		rockchip_usb2phy_usb3_lane_scan_device_add(rport, data);
-		break;
-	case USB_DEVICE_REMOVE:
-		rockchip_usb2phy_usb3_lane_scan_device_remove(rport, data);
-		break;
-	case USB_BUS_REMOVE:
-		rockchip_usb2phy_usb3_lane_scan_bus_remove(rport, data);
-		break;
-	default:
-		return NOTIFY_DONE;
-	}
-
-	return NOTIFY_OK;
-}
-
-static int
-rockchip_usb2phy_usb3_lane_scan_seed_device(struct usb_device *udev, void *data)
-{
-	rockchip_usb2phy_usb3_lane_scan_device_add(data, udev);
-	return 0;
-}
-
-/* The caller must hold rport->mutex and release returned references. */
-static bool
-rockchip_usb2phy_usb3_lane_scan_prune_stale(struct rockchip_usb2phy_port *rport,
-					    struct usb_device **usb2,
-					    struct usb_device **usb3)
-{
-	if (rport->usb3_lane_scan_usb2_dev &&
-	    READ_ONCE(rport->usb3_lane_scan_usb2_dev->state) ==
-		USB_STATE_NOTATTACHED) {
-		*usb2 = rport->usb3_lane_scan_usb2_dev;
-		rport->usb3_lane_scan_usb2_dev = NULL;
-	}
-	if (rport->usb3_lane_scan_usb3_dev &&
-	    READ_ONCE(rport->usb3_lane_scan_usb3_dev->state) ==
-		USB_STATE_NOTATTACHED) {
-		*usb3 = rport->usb3_lane_scan_usb3_dev;
-		rport->usb3_lane_scan_usb3_dev = NULL;
-	}
-
-	return *usb2 || *usb3;
-}
-
-/* The caller must hold rport->mutex. */
-static bool
-rockchip_usb2phy_usb3_lane_scan_stale_needs_poll(struct rockchip_usb2phy_port *rport)
-{
-	return (rport->usb3_lane_scan_usb2_dev &&
-		!READ_ONCE(rport->usb3_lane_scan_usb2_dev->dev.driver)) ||
-	       (rport->usb3_lane_scan_usb3_dev &&
-		!READ_ONCE(rport->usb3_lane_scan_usb3_dev->dev.driver));
-}
-#endif
-
-static void
-rockchip_usb2phy_usb3_lane_scan_stale_work(struct work_struct *work)
-{
-#if IS_REACHABLE(CONFIG_USB)
-	struct rockchip_usb2phy_port *rport =
-		container_of(work, struct rockchip_usb2phy_port,
-			     usb3_lane_scan_stale_work.work);
-	struct usb_device *usb2 = NULL, *usb3 = NULL;
-	bool stale;
-
-	mutex_lock(&rport->mutex);
-	if (!rport->usb3_lane_scan_initialized ||
-	    rport->usb3_lane_scan_suspended ||
-	    rport->usb3_lane_scan_tearing_down)
+	if (!pending)
 		goto unlock;
 
-	stale = rockchip_usb2phy_usb3_lane_scan_prune_stale(rport, &usb2, &usb3);
-	if (stale &&
-	    !rockchip_usb2phy_usb3_lane_scan_direct_present(rport))
-		rockchip_usb2phy_usb3_lane_scan_disconnected(rport);
-	else if (rockchip_usb2phy_usb3_lane_scan_stale_needs_poll(rport))
-		mod_delayed_work(system_freezable_wq,
-				 &rport->usb3_lane_scan_stale_work,
-				 msecs_to_jiffies(USB3_LANE_SCAN_STALE_POLL_MS));
+	ret = host_ls_set_irq(rphy, rport, false);
+	if (ret) {
+		dev_warn_ratelimited(&rport->phy->dev,
+				     "failed to mask host linestate activity: %d\n",
+				     ret);
+		ret = 0;
+		goto unlock;
+	}
+	ret = rockchip_usb2phy_host_ls_ack(rphy, rport);
+	if (ret) {
+		dev_warn_ratelimited(&rport->phy->dev,
+				     "failed to acknowledge host linestate activity: %d\n",
+				     ret);
+		rport->host_ls_ack_pending = true;
+		ret = 0;
+	}
+	rport->host_ls_armed = false;
+	notify = true;
+	goto unlock;
+
+fail_arm:
+	rport->host_ls_armed = false;
 
 unlock:
 	mutex_unlock(&rport->mutex);
-	if (usb2)
-		usb_put_dev(usb2);
-	if (usb3)
-		usb_put_dev(usb3);
-#else
-	(void)work;
-#endif
+	if (notify)
+		blocking_notifier_call_chain(&rport->host_ls_notifier,
+					     ROCKCHIP_USB2PHY_HOST_LS_ACTIVITY,
+					     phy);
+	mutex_unlock(&rport->host_ls_dispatch_lock);
+	return ret;
 }
+EXPORT_SYMBOL_GPL(rockchip_usb2phy_arm_host_ls_activity);
 
-static void
-rockchip_usb2phy_usb3_lane_scan_stop(struct rockchip_usb2phy_port *rport,
-				     bool teardown)
+int rockchip_usb2phy_disarm_host_ls_activity(struct phy *phy)
 {
-	struct rockchip_usb2phy *rphy =
-		dev_get_drvdata(rport->phy->dev.parent);
-	struct device *controller;
-	struct usb_device *usb2 __maybe_unused, *usb3 __maybe_unused;
-	struct phy *phy;
-	enum rockchip_udphy_usb_lane_scan_event event =
-		ROCKCHIP_UDPHY_USB_LANE_SCAN_ATTACH_END;
-	bool unregister __maybe_unused;
-	u32 generation;
-	int submode;
+	struct rockchip_usb2phy_port *rport;
+	struct rockchip_usb2phy *rphy;
+	bool pending;
+	int ret = 0;
 
+	rport = rockchip_usb2phy_host_ls_port(phy);
+	if (!rport)
+		return -ENODEV;
+	rphy = dev_get_drvdata(phy->dev.parent);
+
+	mutex_lock(&rport->host_ls_dispatch_lock);
 	mutex_lock(&rport->mutex);
-	if (teardown)
-		rport->usb3_lane_scan_tearing_down = true;
-	rockchip_usb2phy_lane_scan_new_events(rport, 0);
-	generation = rport->usb3_lane_scan_generation;
-	submode = rockchip_udphy_usb_lane_scan_submode(event, generation);
-	rport->usb3_lane_scan_initialized = false;
-	rport->usb3_lane_scan_trigger_state = USB3_LANE_SCAN_TRIGGER_OFF;
-	rport->usb3_lane_scan_pending_events = 0;
-	rport->usb3_lane_scan_confirm_retries = 0;
-	rport->usb3_lane_scan_resume_probe = false;
-	unregister = rport->usb3_lane_scan_usb_nb_registered;
-	rport->usb3_lane_scan_usb_nb_registered = false;
-	rockchip_usb2phy_enable_line_irq(rphy, rport, false);
-	if (rport->port_cfg->disfall_en.offset)
-		rockchip_usb2phy_enable_host_disc_irq(rphy, rport, false);
-	mutex_unlock(&rport->mutex);
-
-#if IS_REACHABLE(CONFIG_USB)
-	if (unregister)
-		usb_unregister_notify(&rport->usb3_lane_scan_usb_nb);
-#endif
-	cancel_delayed_work_sync(&rport->usb3_lane_scan_work);
-	cancel_delayed_work_sync(&rport->usb3_lane_scan_probe_work);
-	cancel_delayed_work_sync(&rport->usb3_lane_scan_stale_work);
-	cancel_delayed_work_sync(&rport->sm_work);
-
-	mutex_lock(&rport->mutex);
-	phy = rport->usb3_lane_scan_phy;
-	controller = rport->usb3_lane_scan_controller;
-	usb2 = rport->usb3_lane_scan_usb2_dev;
-	usb3 = rport->usb3_lane_scan_usb3_dev;
-	rport->usb3_lane_scan_phy = NULL;
-	rport->usb3_lane_scan_controller = NULL;
-	rport->usb3_lane_scan_usb2_dev = NULL;
-	rport->usb3_lane_scan_usb3_dev = NULL;
-	mutex_unlock(&rport->mutex);
-
-	if (phy) {
-		mutex_lock(&rport->usb3_lane_scan_bridge_mutex);
-		phy_set_mode_ext(phy, PHY_MODE_USB_HOST, submode);
-		mutex_unlock(&rport->usb3_lane_scan_bridge_mutex);
+	if (!rport->host_ls_nb) {
+		ret = -ENOENT;
+		goto unlock;
 	}
-	of_phy_put(phy);
-	if (controller)
-		put_device(controller);
-#if IS_REACHABLE(CONFIG_USB)
-	if (usb2)
-		usb_put_dev(usb2);
-	if (usb3)
-		usb_put_dev(usb3);
-#endif
+
+	ret = host_ls_set_irq(rphy, rport, false);
+	if (ret)
+		goto unlock;
+	rport->host_ls_armed = false;
+	ret = rockchip_usb2phy_host_ls_pending(rphy, rport, &pending);
+	if ((!ret && pending) || rport->host_ls_ack_pending) {
+		ret = rockchip_usb2phy_host_ls_ack(rphy, rport);
+		if (!ret)
+			rport->host_ls_ack_pending = false;
+	}
+
+unlock:
+	mutex_unlock(&rport->mutex);
+	mutex_unlock(&rport->host_ls_dispatch_lock);
+	return ret;
 }
+EXPORT_SYMBOL_GPL(rockchip_usb2phy_disarm_host_ls_activity);
 
-static void rockchip_usb2phy_usb3_lane_scan_cleanup(void *data)
+int
+rockchip_usb2phy_unregister_host_ls_activity_notifier(struct phy *phy, struct notifier_block *nb)
 {
-	rockchip_usb2phy_usb3_lane_scan_stop(data, true);
-}
+	struct rockchip_usb2phy_port *rport;
+	struct rockchip_usb2phy *rphy;
+	bool pending;
+	int first = 0, ret;
 
-static int
-rockchip_usb2phy_usb3_lane_scan_start(struct rockchip_usb2phy_port *rport)
-{
-	struct device *controller;
-	struct phy *phy;
+	if (!phy || !nb)
+		return -EINVAL;
+	rport = rockchip_usb2phy_host_ls_port(phy);
+	if (!rport)
+		return -ENODEV;
+	rphy = dev_get_drvdata(phy->dev.parent);
 
-	if (!IS_REACHABLE(CONFIG_USB))
-		return -EOPNOTSUPP;
+	mutex_lock(&rport->host_ls_dispatch_lock);
+	mutex_lock(&rport->mutex);
+	if (rport->host_ls_nb != nb) {
+		ret = -ENOENT;
+		goto unlock;
+	}
+	rport->host_ls_armed = false;
+	ret = host_ls_set_irq(rphy, rport, false);
+	if (ret)
+		first = ret;
+	ret = rockchip_usb2phy_host_ls_pending(rphy, rport, &pending);
+	if (ret && !first)
+		first = ret;
+	if ((!ret && pending) || rport->host_ls_ack_pending) {
+		ret = rockchip_usb2phy_host_ls_ack(rphy, rport);
+		if (!ret)
+			rport->host_ls_ack_pending = false;
+		else if (!first)
+			first = ret;
+	}
+	mutex_unlock(&rport->mutex);
 
-	phy = rockchip_usb2phy_get_usb3_lane_scan_phy(rport, &controller);
-	if (IS_ERR(phy))
-		return PTR_ERR(phy);
-	if (!rockchip_usb2phy_usb3_lane_scan_phy_supported(phy)) {
-		of_phy_put(phy);
-		put_device(controller);
-		return -EOPNOTSUPP;
+	ret = blocking_notifier_chain_unregister(&rport->host_ls_notifier, nb);
+	if (ret) {
+		if (!first)
+			first = ret;
+		mutex_unlock(&rport->host_ls_dispatch_lock);
+		return first;
 	}
 
 	mutex_lock(&rport->mutex);
-	if (rport->usb3_lane_scan_tearing_down) {
-		mutex_unlock(&rport->mutex);
-		of_phy_put(phy);
-		put_device(controller);
-		return -ESHUTDOWN;
+	WRITE_ONCE(rport->host_ls_nb, NULL);
+	if (rport->host_ls_saved_valid) {
+		ret = host_ls_set_irq(rphy, rport,
+				      rport->host_ls_saved_enabled);
+		if (!ret)
+			rport->host_ls_saved_valid = false;
+		else if (!first)
+			first = ret;
 	}
-	rport->usb3_lane_scan_phy = phy;
-	rport->usb3_lane_scan_controller = controller;
-	rport->usb3_lane_scan_trigger_state =
-		USB3_LANE_SCAN_TRIGGER_WAIT_RISE;
-	rport->usb3_lane_scan_pending_events = 0;
-	rport->usb3_lane_scan_confirm_retries = 0;
-	rport->usb3_lane_scan_resume_probe = false;
-	rport->usb3_lane_scan_suspended = false;
-	rport->usb3_lane_scan_initialized = true;
-#if IS_REACHABLE(CONFIG_USB)
-	rport->usb3_lane_scan_usb_nb.notifier_call =
-		rockchip_usb2phy_usb3_lane_scan_usb_notify;
-	rport->usb3_lane_scan_usb_nb_registered = true;
-#endif
+	ret = first;
+
+unlock:
 	mutex_unlock(&rport->mutex);
-
-#if IS_REACHABLE(CONFIG_USB)
-	usb_register_notify(&rport->usb3_lane_scan_usb_nb);
-	usb_for_each_dev(rport,
-			 rockchip_usb2phy_usb3_lane_scan_seed_device);
-#endif
-
-	return 0;
+	mutex_unlock(&rport->host_ls_dispatch_lock);
+	return ret;
 }
+EXPORT_SYMBOL_GPL(rockchip_usb2phy_unregister_host_ls_activity_notifier);
 
 static int rockchip_usb_bypass_uart(struct rockchip_usb2phy_port *rport,
 				    bool en)
@@ -1670,18 +1152,10 @@ static int rockchip_usb2phy_init(struct phy *phy)
 {
 	struct rockchip_usb2phy_port *rport = phy_get_drvdata(phy);
 	struct rockchip_usb2phy *rphy = dev_get_drvdata(phy->dev.parent);
-	bool lane_scan_started = false;
 	int ret = 0;
 	unsigned int ul, ul_mask;
 
 	dev_dbg(&rport->phy->dev, "port init\n");
-	if (rport->usb3_lane_scan_enabled) {
-		ret = rockchip_usb2phy_usb3_lane_scan_start(rport);
-		if (ret)
-			return dev_err_probe(&rport->phy->dev, ret,
-					     "failed to get companion USB3 PHY\n");
-		lane_scan_started = true;
-	}
 
 	mutex_lock(&rport->mutex);
 
@@ -1717,8 +1191,7 @@ static int rockchip_usb2phy_init(struct phy *phy)
 			schedule_delayed_work(&rport->otg_sm_work,
 					      rport->typec_vbus_det ? 0 : OTG_SCHEDULE_DELAY);
 		}
-	} else if (rport->port_id == USB2PHY_PORT_HOST ||
-		   rport->usb3_lane_scan_enabled) {
+	} else if (rport->port_id == USB2PHY_PORT_HOST) {
 		if (rport->port_cfg->disfall_en.offset) {
 			ret = regmap_read(rphy->grf, rport->port_cfg->utmi_ls.offset, &ul);
 			if (ret < 0)
@@ -1733,22 +1206,30 @@ static int rockchip_usb2phy_init(struct phy *phy)
 			}
 		}
 
-		/* Raw linestate is not an attach source for the scan-only port. */
-		ret = rockchip_usb2phy_enable_line_irq(rphy, rport,
-						       !rport->usb3_lane_scan_enabled);
+		/* clear linestate and enable linestate detect irq */
+		ret = rockchip_usb2phy_enable_line_irq(rphy, rport, true);
 		if (ret) {
 			dev_err(rphy->dev, "failed to enable linestate irq\n");
 			goto out;
 		}
 
-		if (!rport->usb3_lane_scan_enabled)
-			schedule_delayed_work(&rport->sm_work, SCHEDULE_DELAY);
+		schedule_delayed_work(&rport->sm_work, SCHEDULE_DELAY);
 	}
+
+	rport->initialized = true;
+	if (rport->host_ls_nb) {
+		ret = host_ls_set_irq(rphy, rport, rport->host_ls_armed);
+	} else if (rport->host_ls_saved_valid) {
+		ret = host_ls_set_irq(rphy, rport,
+				      rport->host_ls_saved_enabled);
+		if (!ret)
+			rport->host_ls_saved_valid = false;
+	}
+	if (ret)
+		rport->initialized = false;
 
 out:
 	mutex_unlock(&rport->mutex);
-	if (ret && lane_scan_started)
-		rockchip_usb2phy_usb3_lane_scan_stop(rport, false);
 	return ret;
 }
 
@@ -1857,18 +1338,43 @@ unlock:
 static int rockchip_usb2phy_exit(struct phy *phy)
 {
 	struct rockchip_usb2phy_port *rport = phy_get_drvdata(phy);
+	struct rockchip_usb2phy *rphy = dev_get_drvdata(phy->dev.parent);
+	int ret = 0;
 
 	dev_dbg(&rport->phy->dev, "port exit\n");
 
-	if (rport->usb3_lane_scan_enabled)
-		rockchip_usb2phy_usb3_lane_scan_stop(rport, false);
-	else if (rport->port_id == USB2PHY_PORT_HOST)
+	if (rport->port_id == USB2PHY_PORT_OTG)
+		mutex_lock(&rport->host_ls_dispatch_lock);
+	mutex_lock(&rport->mutex);
+	if (rport->host_ls_nb) {
+		ret = host_ls_set_irq(rphy, rport, false);
+		if (ret)
+			dev_warn(&rport->phy->dev,
+				 "failed to mask host linestate activity: %d\n", ret);
+	} else if (rport->host_ls_saved_valid) {
+		ret = host_ls_set_irq(rphy, rport,
+				      rport->host_ls_saved_enabled);
+		if (!ret)
+			rport->host_ls_saved_valid = false;
+		else
+			dev_warn(&rport->phy->dev,
+				 "failed to restore linestate IRQ state: %d\n", ret);
+	}
+	if (!ret)
+		rport->initialized = false;
+	mutex_unlock(&rport->mutex);
+	if (rport->port_id == USB2PHY_PORT_OTG)
+		mutex_unlock(&rport->host_ls_dispatch_lock);
+	if (ret)
+		return ret;
+
+	if (rport->port_id == USB2PHY_PORT_HOST)
 		cancel_delayed_work_sync(&rport->sm_work);
 	else if (rport->port_id == USB2PHY_PORT_OTG &&
 		 rport->otg_sm_work.work.func)
 		flush_delayed_work(&rport->otg_sm_work);
 
-	return 0;
+	return ret;
 }
 
 static int rockchip_set_vbus_power(struct rockchip_usb2phy_port *rport,
@@ -2491,9 +1997,8 @@ static void rockchip_usb2phy_sm_work(struct work_struct *work)
 	struct rockchip_usb2phy_port *rport =
 		container_of(work, struct rockchip_usb2phy_port, sm_work.work);
 	struct rockchip_usb2phy *rphy = dev_get_drvdata(rport->phy->dev.parent);
-	unsigned int linestate, sh, ul, uhd, state;
+	unsigned int sh, ul, uhd, state;
 	unsigned int ul_mask, uhd_mask;
-	unsigned long delay = SCHEDULE_DELAY;
 	int ret;
 
 	if (!rport->port_cfg->utmi_ls.offset ||
@@ -2504,11 +2009,6 @@ static void rockchip_usb2phy_sm_work(struct work_struct *work)
 	}
 
 	mutex_lock(&rport->mutex);
-	/* Raw RK3588 linestate is not a Type-C attach verdict. */
-	if (rport->usb3_lane_scan_enabled) {
-		mutex_unlock(&rport->mutex);
-		return;
-	}
 
 	ret = regmap_read(rphy->grf, rport->port_cfg->utmi_ls.offset, &ul);
 	if (ret < 0)
@@ -2531,8 +2031,8 @@ static void rockchip_usb2phy_sm_work(struct work_struct *work)
 		state = ((uhd & uhd_mask) >> rport->port_cfg->utmi_hstdet.bitstart) |
 			(((ul & ul_mask) >> rport->port_cfg->utmi_ls.bitstart) << sh);
 	} else {
-		linestate = (ul & ul_mask) >> rport->port_cfg->utmi_ls.bitstart;
-		state = linestate << 1 | rport->host_disconnect;
+		state = ((ul & ul_mask) >> rport->port_cfg->utmi_ls.bitstart) << 1 |
+			rport->host_disconnect;
 	}
 
 	switch (state) {
@@ -2604,36 +2104,90 @@ static void rockchip_usb2phy_sm_work(struct work_struct *work)
 
 next_schedule:
 	mutex_unlock(&rport->mutex);
-	schedule_delayed_work(&rport->sm_work, delay);
+	schedule_delayed_work(&rport->sm_work, SCHEDULE_DELAY);
+}
+
+static irqreturn_t
+rockchip_usb2phy_host_ls_activity_irq(struct rockchip_usb2phy_port *rport)
+{
+	struct rockchip_usb2phy *rphy = dev_get_drvdata(rport->phy->dev.parent);
+	bool pending;
+	int ret;
+
+	mutex_lock(&rport->host_ls_dispatch_lock);
+	mutex_lock(&rport->mutex);
+	if (!rport->host_ls_nb || !rport->host_ls_armed ||
+	    !rport->initialized) {
+		mutex_unlock(&rport->mutex);
+		mutex_unlock(&rport->host_ls_dispatch_lock);
+		return IRQ_NONE;
+	}
+
+	ret = rockchip_usb2phy_host_ls_pending(rphy, rport, &pending);
+	if (ret || !pending) {
+		mutex_unlock(&rport->mutex);
+		if (ret)
+			dev_warn_ratelimited(&rport->phy->dev,
+					     "failed to read host linestate activity: %d\n",
+					     ret);
+		mutex_unlock(&rport->host_ls_dispatch_lock);
+		return ret ? IRQ_HANDLED : IRQ_NONE;
+	}
+
+	ret = host_ls_set_irq(rphy, rport, false);
+	if (ret) {
+		mutex_unlock(&rport->mutex);
+		dev_warn_ratelimited(&rport->phy->dev,
+				     "failed to mask host linestate activity: %d\n",
+				     ret);
+		mutex_unlock(&rport->host_ls_dispatch_lock);
+		return IRQ_HANDLED;
+	}
+	ret = rockchip_usb2phy_host_ls_ack(rphy, rport);
+	if (ret) {
+		dev_warn_ratelimited(&rport->phy->dev,
+				     "failed to acknowledge host linestate activity: %d\n",
+				     ret);
+		rport->host_ls_ack_pending = true;
+	}
+	rport->host_ls_armed = false;
+	mutex_unlock(&rport->mutex);
+
+	blocking_notifier_call_chain(&rport->host_ls_notifier,
+				     ROCKCHIP_USB2PHY_HOST_LS_ACTIVITY,
+				     rport->phy);
+	mutex_unlock(&rport->host_ls_dispatch_lock);
+
+	return IRQ_HANDLED;
 }
 
 static irqreturn_t rockchip_usb2phy_linestate_irq(int irq, void *data)
 {
 	struct rockchip_usb2phy_port *rport = data;
 	struct rockchip_usb2phy *rphy = dev_get_drvdata(rport->phy->dev.parent);
-	bool lane_scan;
 
+	mutex_lock(&rport->mutex);
+	if (rport->host_ls_nb) {
+		mutex_unlock(&rport->mutex);
+		return rockchip_usb2phy_host_ls_activity_irq(rport);
+	}
 	if (!property_enabled(rphy->grf, &rport->port_cfg->ls_det_st) ||
-	    !property_enabled(rphy->grf, &rport->port_cfg->ls_det_en))
+	    !property_enabled(rphy->grf, &rport->port_cfg->ls_det_en)) {
+		mutex_unlock(&rport->mutex);
 		return IRQ_NONE;
+	}
 
 	dev_dbg(&rport->phy->dev, "linestate interrupt\n");
 
-	mutex_lock(&rport->mutex);
+	/* disable linestate detect irq and clear its status */
+	rockchip_usb2phy_enable_line_irq(rphy, rport, false);
 
 	/*
 	 * For host port, it may miss disc irq when device is connected,
 	 * in this case, we can clear host_disconnect state depend on
 	 * the linestate irq.
 	 */
-	lane_scan = rport->usb3_lane_scan_enabled &&
-		    rport->usb3_lane_scan_initialized &&
-		    !rport->usb3_lane_scan_suspended &&
-		    !rport->usb3_lane_scan_tearing_down;
-	/* Linestate is not a cable-level verdict for the scan-only topology. */
-	rockchip_usb2phy_enable_line_irq(rphy, rport, false);
-	if (!lane_scan && rport->port_id == USB2PHY_PORT_HOST &&
-	    rport->port_cfg->disfall_en.offset)
+	if (rport->port_id == USB2PHY_PORT_HOST && rport->port_cfg->disfall_en.offset)
 		rport->host_disconnect = false;
 
 	mutex_unlock(&rport->mutex);
@@ -2643,8 +2197,7 @@ static irqreturn_t rockchip_usb2phy_linestate_irq(int irq, void *data)
 	 * meanwhile, if the phy port is suspended, we need rearm the work to
 	 * resume it and mange its states; otherwise, we do nothing about that.
 	 */
-	if (!lane_scan && rport->suspended &&
-	    rport->port_id == USB2PHY_PORT_HOST)
+	if (rport->suspended && rport->port_id == USB2PHY_PORT_HOST)
 		rockchip_usb2phy_sm_work(&rport->sm_work.work);
 
 	return IRQ_HANDLED;
@@ -2726,121 +2279,33 @@ static irqreturn_t rockchip_usb2phy_host_disc_irq(int irq, void *data)
 {
 	struct rockchip_usb2phy_port *rport = data;
 	struct rockchip_usb2phy *rphy = dev_get_drvdata(rport->phy->dev.parent);
-	struct usb_device *stale_usb2 __maybe_unused = NULL;
-	struct usb_device *stale_usb3 __maybe_unused = NULL;
-	bool fall, lane_scan, rise;
-	bool stale = false;
-	int ret;
+
+	if (!property_enabled(rphy->grf, &rport->port_cfg->disfall_st) &&
+	    !property_enabled(rphy->grf, &rport->port_cfg->disrise_st))
+		return IRQ_NONE;
 
 	mutex_lock(&rport->mutex);
-	ret = rockchip_usb2phy_host_disc_irq_snapshot(rphy, rport,
-						      &fall, &rise);
-	if (ret || (!fall && !rise)) {
-		mutex_unlock(&rport->mutex);
-		return IRQ_NONE;
-	}
-	lane_scan = rport->usb3_lane_scan_enabled &&
-		    rport->usb3_lane_scan_initialized &&
-		    !rport->usb3_lane_scan_suspended &&
-		    !rport->usb3_lane_scan_tearing_down;
 
-	/* Preserve the legacy one-edge-at-a-time behavior outside this opt-in. */
-	if (!rport->usb3_lane_scan_enabled) {
-		if (fall) {
-			property_enable(rphy->grf,
-					&rport->port_cfg->disfall_clr, true);
-			rport->host_disconnect = false;
-		} else {
-			property_enable(rphy->grf,
-					&rport->port_cfg->disrise_clr, true);
-			rport->host_disconnect = true;
-		}
-		mutex_unlock(&rport->mutex);
-		return IRQ_HANDLED;
-	}
-
-	/* Snapshot and clear every sticky edge before resolving their meaning. */
-	if (fall)
+	/* clear disconnect fall or rise detect irq pending status */
+	if (property_enabled(rphy->grf, &rport->port_cfg->disfall_st)) {
 		property_enable(rphy->grf, &rport->port_cfg->disfall_clr,
 				true);
-	if (rise)
+		rport->host_disconnect = false;
+	} else if (property_enabled(rphy->grf, &rport->port_cfg->disrise_st)) {
 		property_enable(rphy->grf, &rport->port_cfg->disrise_clr,
 				true);
-
-	if (!lane_scan)
-		goto unlock;
-
-#if IS_REACHABLE(CONFIG_USB)
-	stale = rockchip_usb2phy_usb3_lane_scan_prune_stale(rport, &stale_usb2, &stale_usb3);
-#endif
-	if (stale &&
-	    !rockchip_usb2phy_usb3_lane_scan_direct_present(rport)) {
-		rockchip_usb2phy_usb3_lane_scan_disconnected(rport);
-		goto unlock;
+		rport->host_disconnect = true;
 	}
 
-	/*
-	 * A direct USB child is authoritative.  SuperSpeed companion handoff
-	 * and physical removal can both toggle these raw USB2 edge bits, so no
-	 * edge may start or cancel a scan while that child still exists.
-	 */
-	if (rockchip_usb2phy_usb3_lane_scan_direct_present(rport)) {
-		mod_delayed_work(system_freezable_wq,
-				 &rport->usb3_lane_scan_stale_work,
-				 msecs_to_jiffies(USB3_LANE_SCAN_STALE_RECHECK_MS));
-		goto unlock;
-	}
-
-	switch (rport->usb3_lane_scan_trigger_state) {
-	case USB3_LANE_SCAN_TRIGGER_WAIT_RISE:
-		if (rise) {
-			rport->usb3_lane_scan_trigger_state =
-				USB3_LANE_SCAN_TRIGGER_WAIT_FALL;
-			rport->usb3_lane_scan_trigger_deadline =
-				jiffies +
-				msecs_to_jiffies(USB3_LANE_SCAN_ARM_MS);
-			mod_delayed_work(system_freezable_wq,
-					 &rport->usb3_lane_scan_probe_work,
-					 msecs_to_jiffies(USB3_LANE_SCAN_ARM_MS));
-		}
-		break;
-	case USB3_LANE_SCAN_TRIGGER_WAIT_FALL:
-		if (fall && !rise) {
-			rockchip_usb2phy_usb3_lane_scan_start_probe(rport);
-		} else if (rise) {
-			rport->usb3_lane_scan_trigger_deadline =
-				jiffies +
-				msecs_to_jiffies(USB3_LANE_SCAN_ARM_MS);
-			mod_delayed_work(system_freezable_wq,
-					 &rport->usb3_lane_scan_probe_work,
-					 msecs_to_jiffies(USB3_LANE_SCAN_ARM_MS));
-		}
-		break;
-	case USB3_LANE_SCAN_TRIGGER_PROBING:
-	case USB3_LANE_SCAN_TRIGGER_OFF:
-		break;
-	}
-
-unlock:
 	mutex_unlock(&rport->mutex);
-#if IS_REACHABLE(CONFIG_USB)
-	if (stale_usb2)
-		usb_put_dev(stale_usb2);
-	if (stale_usb3)
-		usb_put_dev(stale_usb3);
-#endif
 
 	return IRQ_HANDLED;
 }
 
 static irqreturn_t rockchip_usb2phy_otg_mux_irq(int irq, void *data)
 {
-	struct rockchip_usb2phy_port *rport = data;
 	irqreturn_t ret = IRQ_NONE;
 
-	if (rport->usb3_lane_scan_enabled &&
-	    rport->port_cfg->disfall_en.offset)
-		ret |= rockchip_usb2phy_host_disc_irq(irq, data);
 	ret |= rockchip_usb2phy_id_irq(irq, data);
 	ret |= rockchip_usb2phy_bvalid_irq(irq, data);
 	ret |= rockchip_usb2phy_linestate_irq(irq, data);
@@ -2865,8 +2330,7 @@ static irqreturn_t rockchip_usb2phy_irq(int irq, void *data)
 		 * Handle disc irq before linestate irq to set the disc
 		 * state for sm work scheduled in the linestate irq handler.
 		 */
-		if ((rport->port_id == USB2PHY_PORT_HOST ||
-		     rport->usb3_lane_scan_enabled) &&
+		if (rport->port_id == USB2PHY_PORT_HOST &&
 		    rport->port_cfg->disfall_en.offset)
 			ret |= rockchip_usb2phy_host_disc_irq(irq, rport);
 
@@ -3216,6 +2680,8 @@ static int rockchip_usb2phy_otg_port_init(struct rockchip_usb2phy *rphy,
 	rport->prev_iddig = true;
 
 	mutex_init(&rport->mutex);
+	mutex_init(&rport->host_ls_dispatch_lock);
+	BLOCKING_INIT_NOTIFIER_HEAD(&rport->host_ls_notifier);
 
 	/* bypass uart function is only used in debug stage. */
 	rport->bypass_uart_en =
@@ -3275,43 +2741,6 @@ static int rockchip_usb2phy_otg_port_init(struct rockchip_usb2phy *rphy,
 	}
 
 	rport->mode = of_usb_get_dr_mode_by_phy(child_np, -1);
-	rport->usb3_lane_scan_enabled =
-		of_property_read_bool(child_np,
-				      "rockchip,usb3-lane-scan-trigger");
-	if (rport->usb3_lane_scan_enabled) {
-		if (!IS_REACHABLE(CONFIG_USB))
-			return dev_err_probe(rphy->dev, -EOPNOTSUPP,
-				"USB3 lane scan trigger requires host usbcore\n");
-		if (rport->mode != USB_DR_MODE_HOST)
-			return dev_err_probe(rphy->dev, -EINVAL,
-				"USB3 lane scan trigger requires fixed host mode\n");
-		if (!rport->port_cfg->utmi_ls.offset ||
-		    !rport->port_cfg->ls_det_en.offset ||
-		    !rport->port_cfg->ls_det_st.offset ||
-		    !rport->port_cfg->ls_det_clr.offset ||
-		    !rport->port_cfg->disfall_en.offset ||
-		    !rport->port_cfg->disfall_st.offset ||
-		    !rport->port_cfg->disfall_clr.offset ||
-		    !rport->port_cfg->disrise_en.offset ||
-		    !rport->port_cfg->disrise_st.offset ||
-		    !rport->port_cfg->disrise_clr.offset)
-			return dev_err_probe(rphy->dev, -EOPNOTSUPP,
-				"USB3 lane scan trigger requires linestate and disconnect detection\n");
-
-		mutex_init(&rport->usb3_lane_scan_bridge_mutex);
-		INIT_DELAYED_WORK(&rport->sm_work, rockchip_usb2phy_sm_work);
-		INIT_DELAYED_WORK(&rport->usb3_lane_scan_work,
-				  rockchip_usb2phy_usb3_lane_scan_work);
-		INIT_DELAYED_WORK(&rport->usb3_lane_scan_probe_work,
-				  rockchip_usb2phy_usb3_lane_scan_probe_work);
-		INIT_DELAYED_WORK(&rport->usb3_lane_scan_stale_work,
-				  rockchip_usb2phy_usb3_lane_scan_stale_work);
-		ret = devm_add_action_or_reset(rphy->dev,
-					       rockchip_usb2phy_usb3_lane_scan_cleanup,
-					       rport);
-		if (ret)
-			return ret;
-	}
 	iddig = property_enabled(rphy->grf, &rport->port_cfg->utmi_iddig);
 	if (rphy->edev_self && (rport->mode == USB_DR_MODE_HOST ||
 	    rport->mode == USB_DR_MODE_UNKNOWN || !iddig)) {
@@ -4249,97 +3678,6 @@ static int rk3588_usb2phy_tuning(struct rockchip_usb2phy *rphy)
 }
 
 #ifdef CONFIG_PM_SLEEP
-static void rockchip_usb2phy_lane_scan_pm_resume(struct rockchip_usb2phy *rphy,
-						 bool reactivate)
-{
-	struct rockchip_usb2phy_port *rport;
-	struct usb_device *stale_usb2 __maybe_unused;
-	struct usb_device *stale_usb3 __maybe_unused;
-	unsigned int index;
-	bool configured_ss, direct, restart_probe;
-	int ret;
-
-	for (index = 0; index < rphy->phy_cfg->num_ports; index++) {
-		rport = &rphy->ports[index];
-		if (!rport->phy || !rport->usb3_lane_scan_enabled || !reactivate)
-			continue;
-
-		stale_usb2 = NULL;
-		stale_usb3 = NULL;
-		mutex_lock(&rport->mutex);
-		if (!rport->usb3_lane_scan_suspended)
-			goto unlock;
-		rport->usb3_lane_scan_suspended = false;
-		if (!rport->usb3_lane_scan_initialized ||
-		    rport->usb3_lane_scan_tearing_down) {
-			rport->usb3_lane_scan_trigger_state =
-				USB3_LANE_SCAN_TRIGGER_OFF;
-			rport->usb3_lane_scan_resume_probe = false;
-			goto unlock;
-		}
-
-#if IS_REACHABLE(CONFIG_USB)
-		rockchip_usb2phy_usb3_lane_scan_prune_stale(rport, &stale_usb2, &stale_usb3);
-#endif
-		configured_ss =
-			rockchip_usb2phy_usb3_lane_scan_confirmable_ss(rport);
-		direct = rockchip_usb2phy_usb3_lane_scan_direct_present(rport);
-		restart_probe = rport->usb3_lane_scan_resume_probe;
-		rport->usb3_lane_scan_resume_probe = false;
-		rport->usb3_lane_scan_confirm_retries = 0;
-		rport->usb3_lane_scan_trigger_state =
-			USB3_LANE_SCAN_TRIGGER_WAIT_RISE;
-
-		if (configured_ss) {
-			rport->usb3_lane_scan_pending_events =
-				USB3_LANE_SCAN_PENDING_BEGIN |
-				USB3_LANE_SCAN_PENDING_CONFIRM;
-			ret = rockchip_usb2phy_enable_line_irq(rphy, rport, false);
-		} else if (direct) {
-			rport->usb3_lane_scan_pending_events =
-				USB3_LANE_SCAN_PENDING_END;
-			ret = rockchip_usb2phy_enable_line_irq(rphy, rport, false);
-		} else if (restart_probe) {
-			rport->usb3_lane_scan_trigger_state =
-				USB3_LANE_SCAN_TRIGGER_PROBING;
-			rport->usb3_lane_scan_trigger_deadline =
-				jiffies +
-				msecs_to_jiffies(USB3_LANE_SCAN_PROBE_MS);
-			rport->usb3_lane_scan_pending_events =
-				USB3_LANE_SCAN_PENDING_BEGIN;
-			ret = rockchip_usb2phy_enable_line_irq(rphy, rport, false);
-			mod_delayed_work(system_freezable_wq,
-					 &rport->usb3_lane_scan_probe_work,
-					 msecs_to_jiffies(USB3_LANE_SCAN_PROBE_MS));
-		} else {
-			rport->usb3_lane_scan_pending_events =
-				USB3_LANE_SCAN_PENDING_END;
-			ret = rockchip_usb2phy_enable_line_irq(rphy, rport, true);
-		}
-		rockchip_usb2phy_usb3_lane_scan_queue(rport, 0);
-#if IS_REACHABLE(CONFIG_USB)
-		if (direct &&
-		    rockchip_usb2phy_usb3_lane_scan_stale_needs_poll(rport))
-			mod_delayed_work(system_freezable_wq,
-					 &rport->usb3_lane_scan_stale_work,
-					 msecs_to_jiffies(USB3_LANE_SCAN_STALE_POLL_MS));
-#endif
-		if (ret)
-			dev_warn(&rport->phy->dev,
-				 "failed to restore lane scan IRQ state: %d\n",
-				 ret);
-
-unlock:
-		mutex_unlock(&rport->mutex);
-#if IS_REACHABLE(CONFIG_USB)
-		if (stale_usb2)
-			usb_put_dev(stale_usb2);
-		if (stale_usb3)
-			usb_put_dev(stale_usb3);
-#endif
-	}
-}
-
 static int rockchip_usb2phy_pm_suspend(struct device *dev)
 {
 	struct rockchip_usb2phy *rphy = dev_get_drvdata(dev);
@@ -4347,6 +3685,7 @@ static int rockchip_usb2phy_pm_suspend(struct device *dev)
 	struct rockchip_usb2phy_port *rport;
 	unsigned int index;
 	int ret = 0;
+	bool activity_enabled;
 	bool wakeup_enable = false;
 
 	if (device_may_wakeup(rphy->dev))
@@ -4368,27 +3707,6 @@ static int rockchip_usb2phy_pm_suspend(struct device *dev)
 		if (!rport->phy)
 			continue;
 
-		if (rport->usb3_lane_scan_enabled) {
-			mutex_lock(&rport->mutex);
-			rport->usb3_lane_scan_resume_probe =
-				rport->usb3_lane_scan_initialized &&
-				rport->usb3_lane_scan_trigger_state ==
-				USB3_LANE_SCAN_TRIGGER_PROBING;
-			if (rport->usb3_lane_scan_initialized &&
-			    !rport->usb3_lane_scan_tearing_down)
-				rockchip_usb2phy_lane_scan_new_events(rport, 0);
-			rport->usb3_lane_scan_suspended = true;
-			rport->usb3_lane_scan_trigger_state =
-				USB3_LANE_SCAN_TRIGGER_OFF;
-			rport->usb3_lane_scan_pending_events = 0;
-			rport->usb3_lane_scan_confirm_retries = 0;
-			mutex_unlock(&rport->mutex);
-			cancel_delayed_work_sync(&rport->usb3_lane_scan_work);
-			cancel_delayed_work_sync(&rport->usb3_lane_scan_probe_work);
-			cancel_delayed_work_sync(&rport->usb3_lane_scan_stale_work);
-			cancel_delayed_work_sync(&rport->sm_work);
-		}
-
 		if (rport->port_cfg->port_ls_filter_con.enable) {
 			ret = regmap_write(rphy->grf,
 					   rport->port_cfg->port_ls_filter_con.offset,
@@ -4408,7 +3726,7 @@ static int rockchip_usb2phy_pm_suspend(struct device *dev)
 			if (ret) {
 				dev_err(rphy->dev,
 					"failed to disable id irq\n");
-				goto err_lane_scan;
+				return ret;
 			}
 		}
 
@@ -4416,18 +3734,27 @@ static int rockchip_usb2phy_pm_suspend(struct device *dev)
 		    rport->bvalid_irq > 0)
 			enable_irq_wake(rport->bvalid_irq);
 
-		/* activate the linestate to detect the next interrupt. */
+		/* Preserve an armed activity one-shot across system sleep. */
 		mutex_lock(&rport->mutex);
-		ret = rockchip_usb2phy_enable_line_irq(rphy, rport,
-						       !rport->usb3_lane_scan_enabled);
+		if (rport->host_ls_nb) {
+			activity_enabled = rport->initialized &&
+					   rport->host_ls_armed;
+			ret = host_ls_set_irq(rphy, rport, activity_enabled);
+		} else {
+			ret = rockchip_usb2phy_enable_line_irq(rphy, rport, true);
+			if (!ret)
+				rport->host_ls_saved_valid = false;
+		}
 		mutex_unlock(&rport->mutex);
 		if (ret) {
 			dev_err(rphy->dev, "failed to enable linestate irq\n");
-			goto err_lane_scan;
+			return ret;
 		}
 
 		if (wakeup_enable && rport->ls_irq > 0)
 			enable_irq_wake(rport->ls_irq);
+		else if (wakeup_enable && rport->otg_mux_irq > 0)
+			enable_irq_wake(rport->otg_mux_irq);
 
 		/* enter low power state */
 		rockchip_usb2phy_low_power_enable(rphy, rport, true);
@@ -4444,10 +3771,6 @@ static int rockchip_usb2phy_pm_suspend(struct device *dev)
 		property_enable(rphy->grf, &phy_cfg->detclk_sel, true);
 
 	return ret;
-
-err_lane_scan:
-	rockchip_usb2phy_lane_scan_pm_resume(rphy, true);
-	return ret;
 }
 
 static int rockchip_usb2phy_pm_resume(struct device *dev)
@@ -4458,7 +3781,6 @@ static int rockchip_usb2phy_pm_resume(struct device *dev)
 	struct regmap *base = get_reg_base(rphy);
 	unsigned int index;
 	bool iddig;
-	bool resume_complete = false;
 	int ret = 0;
 	bool wakeup_enable = false;
 
@@ -4518,7 +3840,7 @@ static int rockchip_usb2phy_pm_resume(struct device *dev)
 			if (ret) {
 				dev_err(rphy->dev,
 					"failed to enable id irq\n");
-				goto out_lane_scan;
+				goto resume_activity;
 			}
 
 			if (iddig != rport->prev_iddig) {
@@ -4533,7 +3855,7 @@ static int rockchip_usb2phy_pm_resume(struct device *dev)
 						      !iddig);
 				ret = rockchip_set_vbus_power(rport, !iddig);
 				if (ret)
-					goto out_lane_scan;
+					goto resume_activity;
 			}
 		}
 
@@ -4548,7 +3870,7 @@ static int rockchip_usb2phy_pm_resume(struct device *dev)
 			if (ret) {
 				dev_err(rphy->dev,
 					"failed to enable bvalid irq\n");
-				goto out_lane_scan;
+				goto resume_activity;
 			}
 
 			if (property_enabled(rphy->grf, &rport->port_cfg->utmi_bvalid))
@@ -4563,18 +3885,48 @@ static int rockchip_usb2phy_pm_resume(struct device *dev)
 
 		if (wakeup_enable && rport->ls_irq > 0)
 			disable_irq_wake(rport->ls_irq);
+		else if (wakeup_enable && rport->otg_mux_irq > 0)
+			disable_irq_wake(rport->otg_mux_irq);
 
 		/* exit low power state */
 		rockchip_usb2phy_low_power_enable(rphy, rport, false);
-
 	}
 
+resume_activity:
 	if (wakeup_enable && rphy->irq > 0)
 		disable_irq_wake(rphy->irq);
 
-	resume_complete = true;
-out_lane_scan:
-	rockchip_usb2phy_lane_scan_pm_resume(rphy, resume_complete);
+	for (index = 0; index < phy_cfg->num_ports; index++) {
+		bool activity_enabled;
+		int monitor_ret = 0;
+
+		rport = &rphy->ports[index];
+		if (!rport->phy)
+			continue;
+
+		mutex_lock(&rport->mutex);
+		if (rport->host_ls_nb) {
+			activity_enabled = rport->initialized &&
+					   rport->host_ls_armed;
+			monitor_ret = host_ls_set_irq(rphy, rport,
+						      activity_enabled);
+		} else if (rport->host_ls_saved_valid) {
+			activity_enabled = rport->host_ls_saved_enabled;
+			monitor_ret = host_ls_set_irq(rphy, rport,
+						      activity_enabled);
+			if (!monitor_ret)
+				rport->host_ls_saved_valid = false;
+		}
+		mutex_unlock(&rport->mutex);
+		if (monitor_ret) {
+			dev_err(rphy->dev,
+				"failed to resume host linestate activity: %d\n",
+				monitor_ret);
+			if (!ret)
+				ret = monitor_ret;
+		}
+	}
+
 	return ret;
 }
 

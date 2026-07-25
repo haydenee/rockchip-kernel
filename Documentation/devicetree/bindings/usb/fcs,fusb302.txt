@@ -11,17 +11,6 @@ Required sub-node:
 
 	Documentation/devicetree/bindings/connector/usb-connector.yaml
 
-Optional properties:
-- fcs,sink-cc-orientation-probe : Enables a board-specific workaround for a
-  fixed-Sink port connected to a peer which also presents Rd and therefore
-  cannot produce a normal TCPM orientation event. The FUSB302 briefly probes
-  each CC pin with default Rp while retaining Rd on the other pin, restores
-  the fixed-Sink state before Type-C attach debounce can complete, and only
-  forwards the measured local plug orientation to the orientation switch.
-  The local CC state does not reveal the far-end plug orientation. This
-  property never permits the driver to enable the VBUS regulator and must not
-  be used on a Source or dual-power-role port.
-
 
 Example:
 

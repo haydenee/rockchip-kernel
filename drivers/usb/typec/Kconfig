@@ -123,6 +123,22 @@ config TYPEC_WUSB3801
 	  If you choose to build this driver as a dynamically linked module, the
 	  module will be called wusb3801.ko.
 
+config TYPEC_LUBANCAT_USB
+	tristate "LubanCat-5 USB-C SuperSpeed lane manager"
+	depends on OF
+	depends on USB
+	depends on TYPEC_FUSB302
+	depends on PHY_ROCKCHIP_INNO_USB2
+	depends on PHY_ROCKCHIP_USBDP
+	help
+	  Enable the board-specific SuperSpeed lane orientation manager used by
+	  LubanCat-5 USB-C host ports without a reliable CC orientation source.
+	  It uses a board-wired FUSB302 as an optional pre-enumeration attach hint,
+	  coordinates that hint or Rockchip USB2 activity with a standard Type-C
+	  orientation switch, and confirms the result through USB enumeration.
+
+	  If built as a module, it will be called lubancat-usb-c-lane.ko.
+
 source "drivers/usb/typec/mux/Kconfig"
 
 source "drivers/usb/typec/altmodes/Kconfig"

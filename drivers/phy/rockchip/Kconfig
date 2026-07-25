@@ -182,6 +182,7 @@ config PHY_ROCKCHIP_USB
 config PHY_ROCKCHIP_USBDP
 	tristate "Rockchip USBDP COMBO PHY Driver"
 	depends on ARCH_ROCKCHIP && OF
+	depends on USB_SUPPORT
 	select GENERIC_PHY
 	select TYPEC
 	select USB_COMMON

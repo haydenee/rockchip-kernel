@@ -4,6 +4,12 @@
 
 #include <linux/configfs.h>
 
+struct device;
+
+#ifdef CONFIG_USB_CONFIGFS_UEVENT
+struct device *create_function_device(char *name);
+#endif
+
 int check_user_usb_string(const char *name,
 		struct usb_gadget_strings *stringtab_dev);
 

@@ -209,6 +209,46 @@
 		pinctrl-0 = <&typec_vbus_en>;
 	};
 
+	typec0_lane_manager: usb-c-lane-manager-0 {
+		compatible = "embedfire,rk3588-lubancat-5-usb-c-lane-manager";
+		orientation-switch;
+		phys = <&u2phy0_otg>;
+		phy-names = "usb2";
+		embedfire,usb-controller = <&usbdrd_dwc3_0>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				typec0_lane_out: endpoint {
+					remote-endpoint = <&usbdp_phy0_orientation_switch>;
+				};
+			};
+
+			port@1 {
+				reg = <1>;
+				typec0_lane_in: endpoint {
+					remote-endpoint = <&usbc0_orien_sw>;
+				};
+			};
+		};
+	};
+
+	typec1_lane_manager: usb-c-lane-manager-1 {
+		compatible = "embedfire,rk3588-lubancat-5-usb-c-lane-manager";
+		phys = <&u2phy1_otg>;
+		phy-names = "usb2";
+		embedfire,usb-controller = <&usbdrd_dwc3_1>;
+
+		port {
+			typec1_lane_out: endpoint {
+				remote-endpoint = <&usbdp_phy1_orientation_switch>;
+			};
+		};
+	};
+
 
 	mipi_dsi0_power: mipi-dsi0-power-regulator {
 		compatible = "regulator-fixed";
@@ -453,8 +493,6 @@
 		pinctrl-names = "default";
 		pinctrl-0 = <&fusb302_int>;
 		vbus-supply = <&vbus_typec>;
-		/* Detect local CC polarity without enabling the Sink-only VBUS rail. */
-		fcs,sink-cc-orientation-probe;
 		status = "okay";
 
 		ports {
@@ -490,7 +528,7 @@
 				port@0 {
 					reg = <0>;
 					usbc0_orien_sw: endpoint {
-						remote-endpoint = <&usbdp_phy0_orientation_switch>;
+						remote-endpoint = <&typec0_lane_in>;
 					};
 				};
 			};
@@ -1356,10 +1394,15 @@
 /* USB3.1/DP Combo PHY1 */
 &usbdp_phy1 {
 	status = "okay";
-	rockchip,usb-lane-auto-scan;
-	rockchip,usb-lane-scan-link-confirm;
+	orientation-switch;
 	sbu1-dc-gpios = <&gpio1 RK_PA2 GPIO_ACTIVE_HIGH>;
 	sbu2-dc-gpios = <&gpio1 RK_PA3 GPIO_ACTIVE_HIGH>;
+
+	port {
+		usbdp_phy1_orientation_switch: endpoint {
+			remote-endpoint = <&typec1_lane_out>;
+		};
+	};
 };
 
 &usbdp_phy1_u3 {
@@ -1378,7 +1421,6 @@
 /* USB3.1/DP Combo PHY0 */
 &usbdp_phy0 {
 	orientation-switch;
-	rockchip,usb-lane-auto-scan;
 	sbu1-dc-gpios = <&gpio1 RK_PB0 GPIO_ACTIVE_HIGH>;
 	sbu2-dc-gpios = <&gpio1 RK_PB1 GPIO_ACTIVE_HIGH>;
 	status = "okay";
@@ -1388,7 +1430,7 @@
 		#size-cells = <0>;
 		usbdp_phy0_orientation_switch: endpoint@0 {
 			reg = <0>;
-			remote-endpoint = <&usbc0_orien_sw>;
+			remote-endpoint = <&typec0_lane_out>;
 		};
 	};
 };
@@ -1437,7 +1479,6 @@
 
 &u2phy1_otg {
 	rockchip,typec-vbus-det;
-	rockchip,usb3-lane-scan-trigger;
 	status = "okay";
 };
 

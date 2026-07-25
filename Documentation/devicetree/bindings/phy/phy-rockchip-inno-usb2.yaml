@@ -180,14 +180,6 @@ properties:
         $ref: /schemas/types.yaml#/definitions/flag
         description: when set, disable the usb2 phy enter suspend automatically.
 
-      rockchip,usb3-lane-scan-trigger:
-        $ref: /schemas/types.yaml#/definitions/flag
-        description:
-          For a fixed-host Type-C port without a CC orientation source, use
-          USB2 linestate and disconnect detection to request lane auto-scan
-          from the USB3 PHY consumed by the same controller. The companion
-          USB3 PHY must explicitly support lane auto-scan.
-
     required:
       - "#phy-cells"
 

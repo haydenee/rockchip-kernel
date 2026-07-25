@@ -23,14 +23,17 @@ properties:
       - description: phy ref clock.
       - description: phy pcs immortal clock.
       - description: phy peripheral clock.
+      - description: USB2 PHY UTMI clock.
 
   clock-names:
     items:
       - const: refclk
       - const: immortal
       - const: pclk
+      - const: utmi
 
   resets:
+    items:
       - description: phy init reset.
       - description: phy cmn reset.
       - description: phy lane reset.
@@ -38,6 +41,7 @@ properties:
       - description: phy pma apb reset.
 
   reset-names:
+    items:
       - const: init
       - const: cmn
       - const: lane
@@ -45,6 +49,7 @@ properties:
       - const: pma_apb
 
   rockchip,dp-lane-mux:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
     minItems: 2
     maxItems: 4
     description:
@@ -56,6 +61,31 @@ properties:
       "rockchip,dp-lane-mux = <0, 1, 2, 3>;", assuming dp lane0 on Type-C phy lane0,
       dp lane1 on Type-C phy lane1, dp lane2 on Type-C phy lane2, dp lane3 on Type-C
       phy lane3. If dp lane map by DisplayPort Alt mode, this property is not need.
+
+  orientation-switch:
+    type: boolean
+    description: The PHY handles Type-C orientation switching.
+
+  svid:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    const: 0xff01
+    description: DisplayPort Standard or Vendor ID used for Type-C Alt Mode.
+
+  sbu1-dc-gpios:
+    maxItems: 1
+    description: GPIO controlling the SBU1 DC path.
+
+  sbu2-dc-gpios:
+    maxItems: 1
+    description: GPIO controlling the SBU2 DC path.
+
+  maximum-speed:
+    $ref: /schemas/usb/usb.yaml#/properties/maximum-speed
+
+  port:
+    $ref: /schemas/graph.yaml#/properties/port
+    description:
+      OF graph connection to the Type-C orientation switch or Alt Mode mux.
 
   rockchip,u2phy-grf:
     $ref: /schemas/types.yaml#/definitions/phandle
@@ -81,27 +111,6 @@ properties:
   rockchip,usbdpphy-clamp:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: When set, clamp phy output. Only work when usbdpphy power off.
-
-  rockchip,usb-lane-auto-scan:
-    type: boolean
-    description:
-      Enables a board-specific USB-only compatibility scan for a non-standard
-      Type-C link whose complete cable orientation is unavailable. While the
-      PHY is powered and neither USB CDR is locked, the driver may try both
-      documented USB lane mappings and freezes the first mapping which locks.
-      An orientation switch, when present, supplies the initial mapping hint.
-      Without one, a companion connection detector must request a new scan on
-      each insertion. This property must not be combined with DisplayPort Alt
-      Mode and never enables DisplayPort lanes.
-
-  rockchip,usb-lane-scan-link-confirm:
-    type: boolean
-    description:
-      Requires a private companion notification from the same USB controller
-      before a CDR-locked mapping is saved as last-good. The notification must
-      represent a configured direct SuperSpeed child; CDR lock alone remains
-      only a candidate. This is intended for a fixed-host connector without a
-      reliable CC orientation source.
 
   dp-port:
     type: object
@@ -136,8 +145,8 @@ required:
   - u3-port
 
 dependencies:
-  rockchip,usb-lane-scan-link-confirm:
-    - rockchip,usb-lane-auto-scan
+  orientation-switch: [ port ]
+  svid: [ port ]
 
 additionalProperties: false
 
@@ -147,15 +156,16 @@ examples:
 
     usbdp_phy0: phy@fed80000 {
       compatible = "rockchip,rk3588-usbdp-phy";
-      reg = <0x0 0xfed80000 0x0 0x10000>;
+      reg = <0xfed80000 0x10000>;
       rockchip,u2phy-grf = <&usb2phy0_grf>;
       rockchip,usb-grf = <&usb_grf>;
       rockchip,usbdpphy-grf = <&usbdpphy0_grf>;
       rockchip,vo-grf = <&vo0_grf>;
       clocks = <&cru CLK_USBDPPHY_MIPIDCPPHY_REF>,
                <&cru CLK_USBDP_PHY0_IMMORTAL>,
-               <&cru PCLK_USBDPPHY0>;
-      clock-names = "refclk", "immortal", "pclk";
+               <&cru PCLK_USBDPPHY0>,
+               <&u2phy0>;
+      clock-names = "refclk", "immortal", "pclk", "utmi";
       resets = <&cru SRST_USBDP_COMBO_PHY0_INIT>,
                <&cru SRST_USBDP_COMBO_PHY0_CMN>,
                <&cru SRST_USBDP_COMBO_PHY0_LANE>,
@@ -172,4 +182,5 @@ examples:
       usbdp_phy0_u3: u3-port {
         #phy-cells = <0>;
         status = "disabled";
+      };
     };

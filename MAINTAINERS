@@ -12101,6 +12101,13 @@ S:	Maintained
 W:	http://linux-test-project.github.io/
 T:	git git://github.com/linux-test-project/ltp.git
 
+LUBANCAT-5 USB-C SUPER-SPEED LANE MANAGER
+M:	EmbedFire <embedfire@embedfire.com>
+L:	linux-usb@vger.kernel.org
+S:	Maintained
+F:	Documentation/devicetree/bindings/usb/embedfire,rk3588-lubancat-5-usb-c-lane-manager.yaml
+F:	drivers/usb/typec/lubancat-usb-c-lane.c
+
 LYNX 28G SERDES PHY DRIVER
 M:	Ioana Ciornei <ioana.ciornei@nxp.com>
 L:	netdev@vger.kernel.org
