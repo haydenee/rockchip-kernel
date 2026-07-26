@@ -7,6 +7,7 @@
 struct device;
 
 #ifdef CONFIG_USB_CONFIGFS_UEVENT
+/* This legacy helper creates a class-level device without a gadget owner. */
 struct device *create_function_device(char *name);
 #endif
 

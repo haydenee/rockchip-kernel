@@ -267,6 +267,8 @@ struct rockchip_usb2phy_cfg {
  * @host_ls_ack_pending: a reported activity still needs acknowledgment.
  * @host_ls_saved_enabled: linestate IRQ state before notifier ownership.
  * @host_ls_saved_valid: saved linestate IRQ state is valid.
+ * @bvalid_irq_wake_enabled: bvalid IRQ wake is enabled.
+ * @linestate_irq_wake_enabled: linestate or OTG mux IRQ wake is enabled.
  * @initialized: the PHY consumer has initialized this port.
  * @dis_u2_susphy: disable usb2 phy suspend.
  * @bvalid_irq: IRQ number assigned for vbus valid rise detection.
@@ -312,6 +314,8 @@ struct rockchip_usb2phy_port {
 	bool		host_ls_ack_pending;
 	bool		host_ls_saved_enabled;
 	bool		host_ls_saved_valid;
+	bool		bvalid_irq_wake_enabled;
+	bool		linestate_irq_wake_enabled;
 	bool		initialized;
 	bool		dis_u2_susphy;
 	int		bvalid_irq;
@@ -360,6 +364,7 @@ struct rockchip_usb2phy_port {
  * @edev: extcon device for notification registration
  * @irq: IRQ number assigned for phy which combined irqs of
  *	 otg port and host port.
+ * @irq_wake_enabled: combined PHY IRQ wake is enabled.
  * @phy_cfg: phy register configuration, assigned by driver data.
  * @ports: phy port instance.
  */
@@ -382,6 +387,7 @@ struct rockchip_usb2phy {
 	bool			edev_self;
 	struct extcon_dev	*edev;
 	int			irq;
+	bool			irq_wake_enabled;
 	const struct rockchip_usb2phy_cfg	*phy_cfg;
 	struct rockchip_usb2phy_port	ports[USB2PHY_NUM_PORTS];
 };
@@ -3678,6 +3684,25 @@ static int rk3588_usb2phy_tuning(struct rockchip_usb2phy *rphy)
 }
 
 #ifdef CONFIG_PM_SLEEP
+static int rockchip_usb2phy_irq_wake(struct rockchip_usb2phy *rphy, int irq,
+				     bool *enabled, bool enable)
+{
+	int ret;
+
+	if (*enabled == enable)
+		return 0;
+
+	ret = enable ? enable_irq_wake(irq) : disable_irq_wake(irq);
+	if (ret) {
+		dev_warn(rphy->dev, "failed to %s IRQ %d as wake source: %d\n",
+			 enable ? "enable" : "disable", irq, ret);
+		return ret;
+	}
+
+	*enabled = enable;
+	return 0;
+}
+
 static int rockchip_usb2phy_pm_suspend(struct device *dev)
 {
 	struct rockchip_usb2phy *rphy = dev_get_drvdata(dev);
@@ -3730,10 +3755,6 @@ static int rockchip_usb2phy_pm_suspend(struct device *dev)
 			}
 		}
 
-		if (rport->port_id == USB2PHY_PORT_OTG && wakeup_enable &&
-		    rport->bvalid_irq > 0)
-			enable_irq_wake(rport->bvalid_irq);
-
 		/* Preserve an armed activity one-shot across system sleep. */
 		mutex_lock(&rport->mutex);
 		if (rport->host_ls_nb) {
@@ -3751,17 +3772,28 @@ static int rockchip_usb2phy_pm_suspend(struct device *dev)
 			return ret;
 		}
 
+		if (rport->port_id == USB2PHY_PORT_OTG && wakeup_enable &&
+		    rport->bvalid_irq > 0)
+			rockchip_usb2phy_irq_wake(rphy, rport->bvalid_irq,
+						  &rport->bvalid_irq_wake_enabled,
+						  true);
+
 		if (wakeup_enable && rport->ls_irq > 0)
-			enable_irq_wake(rport->ls_irq);
+			rockchip_usb2phy_irq_wake(rphy, rport->ls_irq,
+						  &rport->linestate_irq_wake_enabled,
+						  true);
 		else if (wakeup_enable && rport->otg_mux_irq > 0)
-			enable_irq_wake(rport->otg_mux_irq);
+			rockchip_usb2phy_irq_wake(rphy, rport->otg_mux_irq,
+						  &rport->linestate_irq_wake_enabled,
+						  true);
 
 		/* enter low power state */
 		rockchip_usb2phy_low_power_enable(rphy, rport, true);
 	}
 
 	if (wakeup_enable && rphy->irq > 0)
-		enable_irq_wake(rphy->irq);
+		rockchip_usb2phy_irq_wake(rphy, rphy->irq,
+					  &rphy->irq_wake_enabled, true);
 
 	/*
 	 * Select the usb2 phy interrupt logic clock from OSC clock
@@ -3781,7 +3813,9 @@ static int rockchip_usb2phy_pm_resume(struct device *dev)
 	struct regmap *base = get_reg_base(rphy);
 	unsigned int index;
 	bool iddig;
+	int err;
 	int ret = 0;
+	int wake_irq;
 	bool wakeup_enable = false;
 
 	if (device_may_wakeup(rphy->dev))
@@ -3791,21 +3825,33 @@ static int rockchip_usb2phy_pm_resume(struct device *dev)
 	 * PHY lost power in suspend, it needs to reset
 	 * PHY to recovery clock to usb controller.
 	 */
-	if (!wakeup_enable)
-		rockchip_usb2phy_reset(rphy);
-
-	if (phy_cfg->phy_tuning)
-		ret = phy_cfg->phy_tuning(rphy);
-
-	if (phy_cfg->ls_filter_con.disable) {
-		ret = regmap_write(rphy->grf, phy_cfg->ls_filter_con.offset,
-				   phy_cfg->ls_filter_con.disable);
-		if (ret)
-			dev_err(rphy->dev, "failed to set ls filter %d\n", ret);
+	if (!wakeup_enable) {
+		err = rockchip_usb2phy_reset(rphy);
+		if (err && !ret)
+			ret = err;
 	}
 
-	if (phy_cfg->detclk_sel.enable)
-		property_enable(rphy->grf, &phy_cfg->detclk_sel, false);
+	if (phy_cfg->phy_tuning) {
+		err = phy_cfg->phy_tuning(rphy);
+		if (err && !ret)
+			ret = err;
+	}
+
+	if (phy_cfg->ls_filter_con.disable) {
+		err = regmap_write(rphy->grf, phy_cfg->ls_filter_con.offset,
+				   phy_cfg->ls_filter_con.disable);
+		if (err) {
+			dev_err(rphy->dev, "failed to set ls filter %d\n", err);
+			if (!ret)
+				ret = err;
+		}
+	}
+
+	if (phy_cfg->detclk_sel.enable) {
+		err = property_enable(rphy->grf, &phy_cfg->detclk_sel, false);
+		if (err && !ret)
+			ret = err;
+	}
 
 	for (index = 0; index < phy_cfg->num_ports; index++) {
 		rport = &rphy->ports[index];
@@ -3813,11 +3859,15 @@ static int rockchip_usb2phy_pm_resume(struct device *dev)
 			continue;
 
 		if (rport->port_cfg->port_ls_filter_con.disable) {
-			ret = regmap_write(rphy->grf,
+			err = regmap_write(rphy->grf,
 					   rport->port_cfg->port_ls_filter_con.offset,
 					   rport->port_cfg->port_ls_filter_con.disable);
-			if (ret)
-				dev_err(rphy->dev, "failed to set port ls filter %d\n", ret);
+			if (err) {
+				dev_err(rphy->dev,
+					"failed to set port ls filter %d\n", err);
+				if (!ret)
+					ret = err;
+			}
 		}
 
 		if (rport->port_id == USB2PHY_PORT_OTG &&
@@ -3834,13 +3884,15 @@ static int rockchip_usb2phy_pm_resume(struct device *dev)
 				property_enable(base, &rport->port_cfg->iddig_en, true);
 			}
 
-			ret = rockchip_usb2phy_enable_id_irq(rphy, rport,
+			err = rockchip_usb2phy_enable_id_irq(rphy, rport,
 							     true);
 			mutex_unlock(&rport->mutex);
-			if (ret) {
+			if (err) {
 				dev_err(rphy->dev,
 					"failed to enable id irq\n");
-				goto resume_activity;
+				if (!ret)
+					ret = err;
+				goto resume_port;
 			}
 
 			if (iddig != rport->prev_iddig) {
@@ -3853,9 +3905,12 @@ static int rockchip_usb2phy_pm_resume(struct device *dev)
 				extcon_set_state_sync(rphy->edev,
 						      EXTCON_USB_VBUS_EN,
 						      !iddig);
-				ret = rockchip_set_vbus_power(rport, !iddig);
-				if (ret)
-					goto resume_activity;
+				err = rockchip_set_vbus_power(rport, !iddig);
+				if (err) {
+					if (!ret)
+						ret = err;
+					goto resume_port;
+				}
 			}
 		}
 
@@ -3865,36 +3920,50 @@ static int rockchip_usb2phy_pm_resume(struct device *dev)
 		     rport->mode == USB_DR_MODE_OTG) &&
 		    (rport->bvalid_irq > 0 || rport->otg_mux_irq > 0 || rphy->irq > 0) &&
 		    !rport->vbus_always_on) {
-			ret = rockchip_usb2phy_enable_vbus_irq(rphy, rport,
+			err = rockchip_usb2phy_enable_vbus_irq(rphy, rport,
 							       true);
-			if (ret) {
+			if (err) {
 				dev_err(rphy->dev,
 					"failed to enable bvalid irq\n");
-				goto resume_activity;
+				if (!ret)
+					ret = err;
+				goto resume_port;
 			}
 
 			if (property_enabled(rphy->grf, &rport->port_cfg->utmi_bvalid))
 				schedule_delayed_work(&rport->otg_sm_work,
 						      OTG_SCHEDULE_DELAY);
-
 		}
 
-		if (rport->port_id == USB2PHY_PORT_OTG && wakeup_enable &&
-		    rport->bvalid_irq > 0)
-			disable_irq_wake(rport->bvalid_irq);
+resume_port:
+		err = rockchip_usb2phy_irq_wake(rphy, rport->bvalid_irq,
+						&rport->bvalid_irq_wake_enabled,
+						false);
+		if (err && !ret)
+			ret = err;
 
-		if (wakeup_enable && rport->ls_irq > 0)
-			disable_irq_wake(rport->ls_irq);
-		else if (wakeup_enable && rport->otg_mux_irq > 0)
-			disable_irq_wake(rport->otg_mux_irq);
+		wake_irq = rport->ls_irq > 0 ? rport->ls_irq :
+			   rport->otg_mux_irq;
+		err = rockchip_usb2phy_irq_wake(rphy, wake_irq,
+						&rport->linestate_irq_wake_enabled,
+						false);
+		if (err && !ret)
+			ret = err;
 
 		/* exit low power state */
-		rockchip_usb2phy_low_power_enable(rphy, rport, false);
+		err = rockchip_usb2phy_low_power_enable(rphy, rport, false);
+		if (err) {
+			dev_err(rphy->dev,
+				"failed to exit port low power state: %d\n", err);
+			if (!ret)
+				ret = err;
+		}
 	}
 
-resume_activity:
-	if (wakeup_enable && rphy->irq > 0)
-		disable_irq_wake(rphy->irq);
+	err = rockchip_usb2phy_irq_wake(rphy, rphy->irq,
+					&rphy->irq_wake_enabled, false);
+	if (err && !ret)
+		ret = err;
 
 	for (index = 0; index < phy_cfg->num_ports; index++) {
 		bool activity_enabled;

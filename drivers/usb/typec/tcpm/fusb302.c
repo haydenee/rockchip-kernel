@@ -84,6 +84,7 @@ struct fusb302_chip {
 	struct kthread_worker *irq_worker;
 	bool irq_suspended;
 	bool irq_while_suspended;
+	bool irq_wake_enabled;
 	struct gpio_desc *gpio_int_n;
 	int gpio_int_n_irq;
 	struct extcon_dev *extcon;
@@ -1955,10 +1956,14 @@ static int fusb302_probe(struct i2c_client *client,
 		dev_err(dev, "cannot request IRQ for GPIO Int_N, ret=%d", ret);
 		goto tcpm_unregister_port;
 	}
-	enable_irq_wake(chip->gpio_int_n_irq);
+	ret = enable_irq_wake(chip->gpio_int_n_irq);
+	if (ret)
+		dev_warn(dev, "failed to enable IRQ wake: %d\n", ret);
+	else
+		chip->irq_wake_enabled = true;
 	i2c_set_clientdata(client, chip);
 
-	return ret;
+	return 0;
 
 tcpm_unregister_port:
 	tcpm_unregister_port(chip->tcpm_port);
@@ -1977,7 +1982,8 @@ static void fusb302_remove(struct i2c_client *client)
 	struct fusb302_chip *chip = i2c_get_clientdata(client);
 
 	i2c_set_clientdata(client, NULL);
-	disable_irq_wake(chip->gpio_int_n_irq);
+	if (chip->irq_wake_enabled)
+		disable_irq_wake(chip->gpio_int_n_irq);
 	disable_irq(chip->gpio_int_n_irq);
 	kthread_flush_worker(chip->irq_worker);
 	cancel_delayed_work_sync(&chip->bc_lvl_handler);

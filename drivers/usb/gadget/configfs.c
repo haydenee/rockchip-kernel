@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
+#include <linux/atomic.h>
 #include <linux/configfs.h>
 #include <linux/module.h>
 #include <linux/slab.h>
@@ -21,17 +22,21 @@ extern int acc_ctrlrequest_composite(struct usb_composite_dev *cdev,
 void acc_disconnect(void);
 #endif
 static struct class *android_class;
-static struct device *android_device;
-static int index;
-static int gadget_index;
+/* androidN devices retain the legacy 0:0 devt. */
+static atomic_t function_index = ATOMIC_INIT(1);
+static atomic_t gadget_index = ATOMIC_INIT(0);
 
 struct device *create_function_device(char *name)
 {
-	if (android_device && !IS_ERR(android_device))
-		return device_create(android_class, android_device,
-			MKDEV(0, index++), NULL, name);
-	else
-		return ERR_PTR(-EINVAL);
+	int index;
+
+	if (!android_class || IS_ERR(android_class))
+		return ERR_PTR(-ENODEV);
+
+	/* The legacy API has no gadget argument, so it has no gadget parent. */
+	index = atomic_fetch_inc(&function_index);
+	return device_create(android_class, NULL, MKDEV(0, index), NULL,
+			     "%s", name);
 }
 EXPORT_SYMBOL_GPL(create_function_device);
 #endif
@@ -56,8 +61,6 @@ int check_user_usb_string(const char *name,
 #define MAX_NAME_LEN	40
 #define MAX_USB_STRING_LANGS 2
 
-static const struct usb_descriptor_header *otg_desc[2];
-
 struct gadget_info {
 	struct config_group group;
 	struct config_group functions_group;
@@ -72,6 +75,7 @@ struct gadget_info {
 
 	struct usb_composite_driver composite;
 	struct usb_composite_dev cdev;
+	const struct usb_descriptor_header *otg_desc[2];
 	bool use_os_desc;
 	char b_vendor_code;
 	char qw_sign[OS_STRING_QW_SIGN_LEN];
@@ -1388,7 +1392,7 @@ static int configfs_composite_bind(struct usb_gadget *gadget,
 		memcpy(cdev->qw_sign, gi->qw_sign, OS_STRING_QW_SIGN_LEN);
 	}
 
-	if (gadget_is_otg(gadget) && !otg_desc[0]) {
+	if (gadget_is_otg(gadget) && !gi->otg_desc[0]) {
 		struct usb_descriptor_header *usb_desc;
 
 		usb_desc = usb_otg_descriptor_alloc(gadget);
@@ -1397,8 +1401,8 @@ static int configfs_composite_bind(struct usb_gadget *gadget,
 			goto err_comp_cleanup;
 		}
 		usb_otg_descriptor_init(gadget, usb_desc);
-		otg_desc[0] = usb_desc;
-		otg_desc[1] = NULL;
+		gi->otg_desc[0] = usb_desc;
+		gi->otg_desc[1] = NULL;
 	}
 
 	/* Go through all configs, attach all functions */
@@ -1409,7 +1413,7 @@ static int configfs_composite_bind(struct usb_gadget *gadget,
 		struct gadget_config_name *cn;
 
 		if (gadget_is_otg(gadget))
-			c->descriptors = otg_desc;
+			c->descriptors = gi->otg_desc;
 
 		/* Properly configure the bmAttributes wakeup bit */
 		check_remote_wakeup_config(gadget, c);
@@ -1427,7 +1431,7 @@ static int configfs_composite_bind(struct usb_gadget *gadget,
 			s = usb_gstrings_attach(&gi->cdev, cfg->gstrings, 1);
 			if (IS_ERR(s)) {
 				ret = PTR_ERR(s);
-				goto err_comp_cleanup;
+				goto err_purge_funcs;
 			}
 			c->iConfiguration = s[0].id;
 		}
@@ -1459,6 +1463,8 @@ err_purge_funcs:
 	purge_configs_funcs(gi);
 err_comp_cleanup:
 	composite_dev_cleanup(cdev);
+	kfree(gi->otg_desc[0]);
+	gi->otg_desc[0] = NULL;
 	return ret;
 }
 
@@ -1527,10 +1533,10 @@ static void configfs_composite_unbind(struct usb_gadget *gadget)
 	gi->unbind = 1;
 	spin_unlock_irqrestore(&gi->spinlock, flags);
 
-	kfree(otg_desc[0]);
-	otg_desc[0] = NULL;
 	purge_configs_funcs(gi);
 	composite_dev_cleanup(cdev);
+	kfree(gi->otg_desc[0]);
+	gi->otg_desc[0] = NULL;
 	usb_ep_autoconfig_reset(cdev->gadget);
 	spin_lock_irqsave(&gi->spinlock, flags);
 	cdev->gadget = NULL;
@@ -1773,13 +1779,12 @@ static int android_device_create(struct gadget_info *gi)
 
 	INIT_WORK(&gi->work, android_work);
 	gi->dev = device_create(android_class, NULL,
-			MKDEV(0, 0), NULL, "android%d", gadget_index++);
+			MKDEV(0, 0), NULL, "android%d",
+			atomic_fetch_inc(&gadget_index));
 	if (IS_ERR(gi->dev))
 		return PTR_ERR(gi->dev);
 
 	dev_set_drvdata(gi->dev, gi);
-	if (!android_device)
-		android_device = gi->dev;
 
 	attrs = android_usb_attributes;
 	while ((attr = *attrs++)) {
@@ -1787,8 +1792,6 @@ static int android_device_create(struct gadget_info *gi)
 
 		err = device_create_file(gi->dev, attr);
 		if (err) {
-			if (android_device == gi->dev)
-				android_device = NULL;
 			dev_set_drvdata(gi->dev, NULL);
 			device_unregister(gi->dev);
 			gi->dev = NULL;
@@ -1811,8 +1814,6 @@ static void android_device_destroy(struct gadget_info *gi)
 	while ((attr = *attrs++))
 		device_remove_file(dev, attr);
 	dev_set_drvdata(dev, NULL);
-	if (android_device == dev)
-		android_device = NULL;
 	device_unregister(dev);
 	gi->dev = NULL;
 }
@@ -1941,13 +1942,19 @@ static int __init gadget_cfs_init(void)
 
 	config_group_init(&gadget_subsys.su_group);
 
-	ret = configfs_register_subsystem(&gadget_subsys);
-
 #ifdef CONFIG_USB_CONFIGFS_UEVENT
 	android_class = class_create(THIS_MODULE, "android_usb");
 	if (IS_ERR(android_class))
 		return PTR_ERR(android_class);
 #endif
+
+	ret = configfs_register_subsystem(&gadget_subsys);
+	if (ret) {
+#ifdef CONFIG_USB_CONFIGFS_UEVENT
+		class_destroy(android_class);
+		android_class = NULL;
+#endif
+	}
 
 	return ret;
 }
@@ -1957,8 +1964,9 @@ static void __exit gadget_cfs_exit(void)
 {
 	configfs_unregister_subsystem(&gadget_subsys);
 #ifdef CONFIG_USB_CONFIGFS_UEVENT
-	if (!IS_ERR(android_class))
+	if (android_class && !IS_ERR(android_class))
 		class_destroy(android_class);
+	android_class = NULL;
 #endif
 
 }
