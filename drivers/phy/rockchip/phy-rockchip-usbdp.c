@@ -807,6 +807,12 @@ static int udphy_orien_sw_set(struct typec_switch_dev *sw,
 	}
 
 	if (orien == TYPEC_ORIENTATION_NONE) {
+		if (udphy->usb_only_switch &&
+		    (udphy->status & UDPHY_MODE_USB)) {
+			ret = udphy_u3_port_disable(udphy, true);
+			if (ret)
+				goto unlock_ret;
+		}
 		gpiod_set_value_cansleep(udphy->sbu1_dc_gpio, 0);
 		gpiod_set_value_cansleep(udphy->sbu2_dc_gpio, 0);
 		/* unattached */

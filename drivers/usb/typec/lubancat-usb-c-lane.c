@@ -31,6 +31,7 @@
 #define LC_SCAN_INTERVAL_MS	50
 #define LC_LINK_CONFIRM_MS	350
 #define LC_SCAN_TIMEOUT_MS	5000
+#define LC_ROLE_TIMEOUT_MS	1000
 #define LC_DETACH_GUARD_MS	250
 
 enum lc_state {
@@ -81,12 +82,12 @@ struct lc_lane {
 	enum typec_orientation orientation, last_good, input_orientation;
 	enum typec_orientation scan_hint, cc_orientation;
 	struct lc_topology topology;
-	unsigned long deadline, scan_deadline, guard_deadline;
+	unsigned long deadline, scan_deadline, guard_deadline, role_deadline;
 	u64 epoch, event_seq, guard_seq;
 	bool current_valid, attach_pending, activity_armed;
 	bool startup_scan;
 	bool guard_ready, guard_watch, guard_fresh;
-	bool cc_faulted, scan_hint_pending;
+	bool cc_faulted, scan_hint_pending, host_unavailable, root_returned;
 	bool suspended, teardown;
 };
 
@@ -121,14 +122,15 @@ static int lc_snapshot_dev(struct usb_device *udev, void *data)
 
 	if (!udev || !lc_bus_matches(s->controller, udev->bus))
 		return 0;
+	state = READ_ONCE(udev->state);
 	if (lc_root(udev)) {
-		if (READ_ONCE(udev->speed) >= USB_SPEED_SUPER)
+		if (state != USB_STATE_NOTATTACHED &&
+		    READ_ONCE(udev->speed) >= USB_SPEED_SUPER)
 			s->topology.ss_root = true;
 		return 0;
 	}
 	if (!lc_direct(udev))
 		return 0;
-	state = READ_ONCE(udev->state);
 	if (state == USB_STATE_NOTATTACHED)
 		return 0;
 	s->topology.direct = true;
@@ -148,9 +150,71 @@ static bool lc_has_configured_child(const struct lc_topology *topology)
 	return topology->configured_usb2 || topology->configured_ss;
 }
 
+static bool lc_phy_is_host_mode(enum phy_mode mode)
+{
+	return mode >= PHY_MODE_USB_HOST && mode <= PHY_MODE_USB_HOST_SS;
+}
+
+static bool lc_host_mode_visible(const struct lc_lane *lane, enum phy_mode mode)
+{
+	/* Board policy may change DWC3 role without updating the USB2 PHY role. */
+	return lc_phy_is_host_mode(mode) || lane->topology.ss_root;
+}
+
+static bool lc_host_policy_enabled(const struct lc_lane *lane)
+{
+	enum phy_mode mode = phy_get_mode(lane->usb2_phy);
+
+	if (lane->host_unavailable)
+		return false;
+	/* Preserve one bounded preset for a device attached before DWC3 probes. */
+	return lc_host_mode_visible(lane, mode) ||
+	       (mode == PHY_MODE_INVALID && lane->startup_scan &&
+		(lane->scan_hint_pending || time_before(jiffies, lane->deadline)));
+}
+
+static bool lc_can_bootstrap_cc(const struct lc_lane *lane, enum phy_mode mode)
+{
+	return mode == PHY_MODE_INVALID && lane->startup_scan &&
+	       lane->cc_orientation == TYPEC_ORIENTATION_NONE &&
+	       time_before(jiffies, lane->deadline);
+}
+
+static bool lc_role_transition_pending(const struct lc_lane *lane,
+				       unsigned long now)
+{
+	bool host_mode;
+
+	if (!lane->host_unavailable || !lane->role_deadline ||
+	    time_after_eq(now, lane->role_deadline))
+		return false;
+	host_mode = lc_phy_is_host_mode(phy_get_mode(lane->usb2_phy));
+
+	return (lane->root_returned && !host_mode) ||
+	       (!lane->root_returned && host_mode);
+}
+
+static bool lc_can_execute(const struct lc_lane *lane, enum lc_state state,
+			   unsigned long now)
+{
+	enum phy_mode mode = phy_get_mode(lane->usb2_phy);
+
+	return (state == LC_RESTORE &&
+		!lc_role_transition_pending(lane, now)) ||
+	       (!lane->host_unavailable &&
+		(lc_host_mode_visible(lane, mode) ||
+		 (state == LC_PRESET && mode == PHY_MODE_INVALID &&
+		  lane->startup_scan)));
+}
+
 static bool lc_should_poll_cc(const struct lc_lane *lane)
 {
-	return lane->cc_dev && !lane->cc_faulted &&
+	enum phy_mode mode = phy_get_mode(lane->usb2_phy);
+
+	return !lane->host_unavailable &&
+	       (lc_host_mode_visible(lane, mode) ||
+		lc_can_bootstrap_cc(lane, mode)) &&
+	       lane->cc_dev && !lane->cc_faulted &&
 	       !lane->suspended && !lane->teardown &&
 	       lane->input_orientation == TYPEC_ORIENTATION_NONE &&
 	       !lc_has_configured_child(&lane->topology);
@@ -202,6 +266,15 @@ static void lc_clear_guard(struct lc_lane *lane)
 	lane->guard_seq++;
 }
 
+static void lc_stop_host_policy(struct lc_lane *lane)
+{
+	lane->activity_armed = false;
+	lane->cc_orientation = TYPEC_ORIENTATION_NONE;
+	memset(&lane->topology, 0, sizeof(lane->topology));
+	lc_clear_scan(lane);
+	lc_clear_guard(lane);
+}
+
 static bool lc_guard_active(const struct lc_lane *lane)
 {
 	return lane->guard_deadline;
@@ -228,7 +301,9 @@ static u64 lc_start_guard(struct lc_lane *lane, bool detector_cleared,
 static bool lc_needs_restore(struct lc_lane *lane)
 {
 	return lane->input_orientation == TYPEC_ORIENTATION_NONE &&
-	       (!lane->current_valid || lane->orientation != lane->last_good);
+	       (!lane->current_valid ||
+		(!lane->host_unavailable &&
+		 lane->orientation != lane->last_good));
 }
 
 static bool lc_has_scan_intent(struct lc_lane *lane)
@@ -295,7 +370,9 @@ static void lc_begin_hot_scan(struct lc_lane *lane)
 	bool fresh = lc_guard_active(lane) && lane->guard_watch &&
 		     !lane->guard_fresh;
 
-	if (lane->input_orientation != TYPEC_ORIENTATION_NONE)
+	if (lane->host_unavailable ||
+	    !lc_host_mode_visible(lane, phy_get_mode(lane->usb2_phy)) ||
+	    lane->input_orientation != TYPEC_ORIENTATION_NONE)
 		return;
 	if (fresh)
 		lane->guard_fresh = true;
@@ -328,18 +405,32 @@ static void lc_cc_work(struct work_struct *work)
 {
 	struct lc_lane *lane = container_of(work, struct lc_lane, cc_work.work);
 	enum typec_orientation orientation = TYPEC_ORIENTATION_NONE;
+	enum phy_mode mode;
 	unsigned int interval = LC_CC_OPEN_INTERVAL_MS;
+	bool host_root;
 	u64 guard_seq;
 	int ret;
 
 	mutex_lock(&lane->lock);
+	if (!lc_host_policy_enabled(lane)) {
+		lc_queue(lane, 0);
+		goto out;
+	}
 	if (!lc_should_poll_cc(lane))
 		goto out;
 	if (lane->cc_orientation != TYPEC_ORIENTATION_NONE)
 		interval = LC_CC_PRESENT_INTERVAL_MS;
+	host_root = lane->topology.ss_root;
 	guard_seq = lane->guard_seq;
 	mutex_unlock(&lane->lock);
 
+	mode = phy_get_mode(lane->usb2_phy);
+	if (!lc_phy_is_host_mode(mode) && !host_root &&
+	    mode != PHY_MODE_INVALID) {
+		mutex_lock(&lane->lock);
+		lc_queue(lane, 0);
+		goto out;
+	}
 	ret = fusb302_sink_cc_sample(lane->cc_dev, &orientation);
 
 	mutex_lock(&lane->lock);
@@ -357,8 +448,11 @@ static void lc_cc_work(struct work_struct *work)
 			"FUSB302 CC sampling requires a fixed Sink port\n");
 		goto out;
 	}
-	if (!lc_should_poll_cc(lane))
+	if (!lc_should_poll_cc(lane)) {
+		if (!lc_host_policy_enabled(lane))
+			lc_queue(lane, 0);
 		goto out;
+	}
 	if (guard_seq != lane->guard_seq)
 		goto requeue;
 	if (ret) {
@@ -410,6 +504,8 @@ static void lc_cc_work(struct work_struct *work)
 
 requeue:
 	lc_queue_cc(lane, msecs_to_jiffies(interval));
+	if (!lc_host_policy_enabled(lane))
+		lc_queue(lane, 0);
 out:
 	mutex_unlock(&lane->lock);
 }
@@ -433,7 +529,10 @@ static bool lc_complete_hot_scan(struct lc_lane *lane, int ret)
 
 static bool lc_can_keep_activity(const struct lc_lane *lane)
 {
-	return !lane->suspended && !lane->teardown &&
+	return !lane->host_unavailable &&
+	       lc_host_mode_visible(lane, phy_get_mode(lane->usb2_phy)) &&
+	       lane->current_valid &&
+	       !lane->suspended && !lane->teardown &&
 	       (!lane->topology.direct || lc_guard_active(lane)) &&
 	       !(lane->attach_pending && lane->scan_deadline) &&
 	       lane->input_orientation == TYPEC_ORIENTATION_NONE;
@@ -486,6 +585,15 @@ static void lc_arm_activity(struct lc_lane *lane)
 	int ret;
 
 	mutex_lock(&lane->activity_lock);
+	mutex_lock(&lane->lock);
+	if (!lc_can_keep_activity(lane)) {
+		lane->activity_armed = false;
+		mutex_unlock(&lane->lock);
+		__lc_disarm_activity(lane);
+		mutex_unlock(&lane->activity_lock);
+		return;
+	}
+	mutex_unlock(&lane->lock);
 	ret = rockchip_usb2phy_arm_host_ls_activity(lane->usb2_phy);
 	mutex_lock(&lane->lock);
 	if (!ret) {
@@ -569,7 +677,9 @@ static void lc_execute(struct lc_lane *lane, struct lc_op *op)
 
 	mutex_lock(&lane->switch_lock);
 	mutex_lock(&lane->lock);
-	valid = !lane->teardown && !lane->suspended &&
+	now = jiffies;
+	valid = lc_can_execute(lane, op->state, now) &&
+		!lane->teardown && !lane->suspended &&
 		!lc_guard_active(lane) &&
 		lane->epoch == op->epoch &&
 		lane->event_seq == op->event_seq;
@@ -578,21 +688,34 @@ static void lc_execute(struct lc_lane *lane, struct lc_op *op)
 		executed = true;
 		ret = typec_switch_set(lane->sw, op->target);
 	}
-
 	mutex_lock(&lane->lock);
-	if (executed && !ret && op->target != TYPEC_ORIENTATION_NONE) {
-		lane->orientation = op->target;
-		lane->current_valid = true;
-		if (lane->scan_hint_pending && op->target == lane->scan_hint)
-			lane->scan_hint_pending = false;
+	now = jiffies;
+	if (executed && !ret) {
+		if (op->target == TYPEC_ORIENTATION_NONE) {
+			lane->current_valid = false;
+		} else {
+			lane->orientation = op->target;
+			lane->current_valid = true;
+			if (lane->scan_hint_pending && op->target == lane->scan_hint)
+				lane->scan_hint_pending = false;
+		}
 	}
-	valid = executed && !lane->teardown && !lane->suspended &&
+	valid = executed && lc_can_execute(lane, op->state, now) &&
+		!lane->teardown && !lane->suspended &&
 		lane->epoch == op->epoch;
 	if (!valid) {
-		if (!executed && lane->epoch == op->epoch &&
-		    lane->state == LC_APPLY) {
-			if (lane->attach_pending && lane->scan_deadline &&
-			    !lane->startup_scan)
+		if (!executed && op->state == LC_RESTORE &&
+		    lc_role_transition_pending(lane, now)) {
+			lc_invalidate(lane, LC_RESTORE);
+			lc_queue(lane,
+				 min(msecs_to_jiffies(LC_SCAN_INTERVAL_MS),
+				     lane->role_deadline - now));
+			goto complete;
+		}
+		if (lane->epoch == op->epoch && lane->state == LC_APPLY) {
+			if (executed ||
+			    (lane->attach_pending && lane->scan_deadline &&
+			     !lane->startup_scan))
 				lc_invalidate(lane, LC_IDLE);
 			else
 				lc_invalidate(lane, op->state);
@@ -628,7 +751,6 @@ static void lc_execute(struct lc_lane *lane, struct lc_op *op)
 		} else if (ret == -EBUSY) {
 			lc_defer_scan(lane, LC_LINK_CONFIRM_MS);
 		} else if (ret == -EAGAIN) {
-			now = jiffies;
 			if (lane->scan_deadline &&
 			    time_before(now, lane->scan_deadline)) {
 				lc_invalidate(lane, op->state);
@@ -712,6 +834,7 @@ static int lc_input_set(struct typec_switch_dev *sw,
 			lc_clear_scan(lane);
 		} else {
 			lane->cc_orientation = TYPEC_ORIENTATION_NONE;
+			lane->current_valid = false;
 		}
 	}
 	if (!lane->suspended && !lane->teardown) {
@@ -778,15 +901,22 @@ static int lc_usb_notify(struct notifier_block *nb,
 	if (lane->teardown)
 		goto out;
 	lane->event_seq++;
+	if ((action == USB_BUS_ADD ||
+	     (action == USB_DEVICE_ADD && root)) &&
+	    lane->host_unavailable) {
+		lane->root_returned = true;
+		lane->role_deadline = jiffies +
+				      msecs_to_jiffies(LC_ROLE_TIMEOUT_MS);
+	}
 	if (action == USB_BUS_REMOVE ||
 	    (action == USB_DEVICE_REMOVE && root)) {
-		lane->activity_armed = false;
+		lane->host_unavailable = true;
+		lane->root_returned = false;
+		lane->role_deadline = jiffies +
+				      msecs_to_jiffies(LC_ROLE_TIMEOUT_MS);
+		lc_stop_host_policy(lane);
+		lc_invalidate(lane, LC_IDLE);
 		clear_activity = true;
-		memset(&lane->topology, 0, sizeof(lane->topology));
-		if (lane->input_orientation == TYPEC_ORIENTATION_NONE)
-			guard_seq = lc_start_guard(lane, false, false);
-		else
-			lc_invalidate(lane, LC_IDLE);
 	} else if (action == USB_DEVICE_REMOVE && direct) {
 		/* REMOVE is authoritative even while usb_for_each_dev is stale. */
 		lane->topology.direct = false;
@@ -798,6 +928,12 @@ static int lc_usb_notify(struct notifier_block *nb,
 		clear_activity = true;
 		if (lane->input_orientation == TYPEC_ORIENTATION_NONE)
 			guard_seq = lc_start_guard(lane, false, disconnected);
+	} else if (action == USB_DEVICE_ADD && direct &&
+		   READ_ONCE(udev->speed) < USB_SPEED_SUPER) {
+		/* Recover an attach edge consumed before the peer became ready. */
+		lane->activity_armed = false;
+		clear_activity = true;
+		lc_begin_hot_scan(lane);
 	}
 	if (clear_activity || action == USB_BUS_ADD ||
 	    (action == USB_DEVICE_ADD && root))
@@ -827,6 +963,9 @@ static int lc_usb2_notify(struct notifier_block *nb,
 	lane->activity_armed = false;
 	if (lane->teardown)
 		goto out;
+	if (lane->host_unavailable ||
+	    !lc_host_mode_visible(lane, phy_get_mode(lane->usb2_phy)))
+		goto out;
 	/* Publish arm before accepting either IRQ or synchronous replay. */
 	if (!was_armed)
 		goto out;
@@ -853,7 +992,8 @@ static void lc_work(struct work_struct *work)
 	struct lc_op op = { };
 	unsigned long now;
 	u64 seq;
-	bool arm = false, detached, disarm = false, sync_activity = false;
+	bool arm = false, detached, disarm = false, host_resumed;
+	bool host_root_new, role_expired, role_pending, sync_activity = false;
 
 	mutex_lock(&lane->lock);
 	if (lane->suspended || lane->teardown) {
@@ -874,9 +1014,50 @@ static void lc_work(struct work_struct *work)
 	/* The in-flight switch call owns APPLY and handles the next snapshot. */
 	if (lane->state == LC_APPLY)
 		goto out;
-
 	now = jiffies;
-	sync_activity = !lane->topology.ss_root && s.topology.ss_root &&
+	role_expired = lane->role_deadline &&
+		time_after_eq(now, lane->role_deadline);
+	host_resumed = lane->host_unavailable && lane->root_returned &&
+		s.topology.ss_root &&
+		(lc_phy_is_host_mode(phy_get_mode(lane->usb2_phy)) ||
+		 role_expired);
+	host_root_new = !lane->host_unavailable && !lane->topology.ss_root &&
+		s.topology.ss_root;
+	if (host_root_new)
+		lane->topology.ss_root = true;
+	if (host_resumed) {
+		lane->topology.ss_root = true;
+		lane->host_unavailable = false;
+		lane->root_returned = false;
+		lane->role_deadline = 0;
+	}
+	if (!lc_host_policy_enabled(lane)) {
+		lc_stop_host_policy(lane);
+		lane->topology.ss_root = s.topology.ss_root;
+		disarm = true;
+		role_pending = lc_role_transition_pending(lane, now);
+		if (role_pending)
+			lc_queue(lane,
+				 min(msecs_to_jiffies(LC_SCAN_INTERVAL_MS),
+				     lane->role_deadline - now));
+		else if (lane->role_deadline)
+			lane->role_deadline = 0;
+		if (lc_needs_restore(lane)) {
+			if (role_pending)
+				goto out;
+			lc_invalidate(lane, LC_RESTORE);
+			goto prepare;
+		}
+		if (lane->state != LC_IDLE)
+			lc_invalidate(lane, LC_IDLE);
+		goto out;
+	}
+	if (host_resumed || lane->role_deadline || host_root_new) {
+		lane->role_deadline = 0;
+		lc_queue_cc(lane, 0);
+	}
+
+	sync_activity = host_root_new &&
 			lane->activity_armed &&
 			lane->input_orientation == TYPEC_ORIENTATION_NONE &&
 			!lc_has_configured_child(&s.topology);
@@ -968,9 +1149,8 @@ static void lc_work(struct work_struct *work)
 		goto out;
 	}
 	/*
-	 * Keep a scan that started during the peer's initial attach window.
-	 * An established USB2 child must never create a late scan, but it must
-	 * not truncate the original bounded chance to find its SS companion.
+	 * USB2 ADD publishes its fallback deadline before this snapshot.  An
+	 * established child without an active generation remains quiescent.
 	 */
 	if (s.topology.configured_usb2 && !lane->scan_deadline) {
 		lc_mark_activity_disarm(lane);
@@ -989,6 +1169,10 @@ static void lc_work(struct work_struct *work)
 		if (lane->state != LC_IDLE)
 			lc_invalidate(lane, LC_IDLE);
 		goto out;
+	}
+	if (!lane->current_valid && !lane->scan_deadline) {
+		lc_restore(lane);
+		goto prepare;
 	}
 	if (s.topology.direct) {
 		lc_mark_activity_disarm(lane);
@@ -1267,6 +1451,7 @@ static int lc_probe(struct platform_device *pdev)
 	/* Seed one bounded no-CC search for the first SuperSpeed root. */
 	lane->attach_pending = true;
 	lane->startup_scan = true;
+	lane->deadline = jiffies + msecs_to_jiffies(LC_SCAN_TIMEOUT_MS);
 	lane->suspended = true;
 	mutex_init(&lane->lock);
 	mutex_init(&lane->switch_lock);
