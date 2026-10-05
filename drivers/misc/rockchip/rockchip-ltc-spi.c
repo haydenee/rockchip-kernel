@@ -21,6 +21,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/overflow.h>
 #include <linux/platform_device.h>
 #include <linux/ptp_clock_kernel.h>
 #include <linux/seq_file.h>
@@ -40,12 +41,14 @@
 #define RK_LTC_DEFAULT_MAX_SLEW_PPM		1000
 #define RK_LTC_MAX_SLEW_PPM			100000
 #define RK_LTC_DEFAULT_LOCK_THRESHOLD_MS	5
-#define RK_LTC_DEFAULT_PLL_KP_PPB_PER_MS	10000
-#define RK_LTC_DEFAULT_PLL_KI_PPB_PER_MS_S	2000
+#define RK_LTC_DEFAULT_PLL_KP_PPB_PER_MS	700000
+#define RK_LTC_DEFAULT_PLL_KI_PPB_PER_MS_S	150000
 #define RK_LTC_MAX_PLL_GAIN			1000000
 #define RK_LTC_PLL_ERROR_CLAMP_NS		(10LL * NSEC_PER_SEC)
 #define RK_LTC_NSEC_PER_MSEC			1000000LL
 #define RK_LTC_NSEC_PER_USEC			1000LL
+#define RK_LTC_OBSERVATION_MAX_NS			100000ULL
+#define RK_LTC_SPI_FIFO_BYTES			64U
 
 /* Rockchip SPI register offsets */
 #define ROCKCHIP_SPI_CTRLR0			0x0000
@@ -153,7 +156,19 @@ struct rk_ltc {
 	u32 sync_state;
 	s32 sync_correction_ppb;
 	s32 sync_integral_ppb;
+	s32 sync_integral_rem;
 	s64 sync_phase_error_ns;
+	/* One reference/cursor snapshot per refill, shared by all its codewords. */
+	bool sync_observation_valid;
+	s64 sync_reference_ns;
+	u64 sync_output_samples;
+	u64 sync_observation_span_ns;
+	u64 sync_observation_rejects;
+	u32 sync_fifo_bytes;
+	u32 sync_lock_streak;
+	/* Keep a fixed midnight epoch across running fractional-rate day wraps. */
+	bool sync_epoch_valid;
+	s64 sync_epoch_ns;
 
 	u64 codewords_generated;
 	u64 samples_generated;
@@ -345,20 +360,6 @@ static s64 rk_ltc_mod_day_ns(s64 ns)
 	return ns;
 }
 
-static u64 rk_ltc_pipeline_latency_ns(const struct rk_ltc *ltc)
-{
-	u64 samples;
-	u32 rate = ltc->actual_sample_rate ? ltc->actual_sample_rate :
-		   ltc->sample_rate;
-
-	if (!rate || !ltc->periods)
-		return 0;
-
-	samples = (u64)(ltc->periods - 1) * ltc->period_bytes * 8;
-
-	return div64_u64(samples * NSEC_PER_SEC, rate);
-}
-
 static int rk_ltc_read_sync_time(const struct rk_ltc_sync_config *cfg,
 				 s64 *ns)
 {
@@ -397,6 +398,109 @@ static int rk_ltc_read_sync_time(const struct rk_ltc_sync_config *cfg,
 	return 0;
 }
 
+/*
+ * Extend a cyclic DMA cursor relative to the completed-period counter. A
+ * delayed/missed callback must not masquerade as nearly one extra ring of
+ * playback. The counter has already advanced for this callback.
+ */
+static int rk_ltc_output_position(struct rk_ltc *ltc, u32 residue,
+				  u32 fifo_bytes, bool busy, u64 *samples)
+{
+	u64 completed = ltc->dma_periods * ltc->period_bytes;
+	u32 cursor, base, ahead;
+	u64 bytes;
+
+	if (residue > ltc->ring_bytes || fifo_bytes > RK_LTC_SPI_FIFO_BYTES ||
+	    !busy || !ltc->period_bytes || !ltc->ring_bytes)
+		return -EAGAIN;
+
+	cursor = (ltc->ring_bytes - residue) % ltc->ring_bytes;
+	base = completed % ltc->ring_bytes;
+	ahead = (cursor + ltc->ring_bytes - base) % ltc->ring_bytes;
+	if (ahead >= ltc->period_bytes)
+		return -EAGAIN;
+
+	bytes = completed + ahead;
+	if (bytes <= fifo_bytes)
+		return -EAGAIN;
+
+	/* TXFLR excludes the active shifter; estimate its remaining half byte. */
+	*samples = (bytes - fifo_bytes) * 8 - 4;
+	return 0;
+}
+
+static int rk_ltc_observe_playback_locked(struct rk_ltc *ltc)
+{
+	struct dma_tx_state before, after;
+	enum dma_status status;
+	u64 begin_ns, end_ns, samples;
+	s64 ref_ns;
+	u32 fifo, sr;
+	int ret, retry;
+
+	ltc->sync_observation_valid = false;
+	if (!ltc->running || ltc->sync_cfg.source == RK_LTC_SYNC_SOURCE_NONE ||
+	    ltc->cfg.mode != RK_LTC_MODE_NORMAL)
+		return -EAGAIN;
+
+	for (retry = 0; retry < 3; retry++) {
+		begin_ns = ktime_get_raw_ns();
+		status = dmaengine_tx_status(ltc->tx_chan, ltc->dma_cookie,
+					     &before);
+		if (status != DMA_IN_PROGRESS)
+			break;
+		ret = rk_ltc_read_sync_time(&ltc->sync_cfg, &ref_ns);
+		if (ret)
+			break;
+		fifo = readl_relaxed(ltc->regs + ROCKCHIP_SPI_TXFLR);
+		sr = readl_relaxed(ltc->regs + ROCKCHIP_SPI_SR);
+		status = dmaengine_tx_status(ltc->tx_chan, ltc->dma_cookie,
+					     &after);
+		end_ns = ktime_get_raw_ns();
+		if (status != DMA_IN_PROGRESS ||
+		    end_ns - begin_ns > RK_LTC_OBSERVATION_MAX_NS ||
+		    before.residue != after.residue)
+			continue;
+		ret = rk_ltc_output_position(ltc, after.residue, fifo,
+					     sr & SR_BUSY, &samples);
+		if (ret)
+			continue;
+
+		/*
+		 * PL330's SAR may include one prefetched 16-byte burst not yet
+		 * in TXFLR. Together with the shifter and snapshot span this
+		 * bounds the observation error; it is not sample-exact timing.
+		 */
+		ltc->sync_reference_ns = ref_ns;
+		ltc->sync_output_samples = samples;
+		ltc->sync_fifo_bytes = fifo;
+		ltc->sync_observation_span_ns = end_ns - begin_ns;
+		ltc->sync_observation_valid = true;
+		return 0;
+	}
+
+	ltc->sync_observation_rejects++;
+	ltc->sync_state = RK_LTC_SYNC_STATE_HOLD;
+	ltc->sync_lock_streak = 0;
+	return -EAGAIN;
+}
+
+static int rk_ltc_boundary_reference(struct rk_ltc *ltc, s64 *ref_ns)
+{
+	u64 queued, delay_ns;
+
+	if (!ltc->sync_observation_valid || !ltc->actual_sample_rate ||
+	    ltc->samples_generated < ltc->sync_output_samples)
+		return -EAGAIN;
+	queued = ltc->samples_generated - ltc->sync_output_samples;
+	if (queued > ((u64)ltc->ring_bytes + RK_LTC_SPI_FIFO_BYTES + 1) * 8)
+		return -EAGAIN;
+	delay_ns = div64_u64(queued * NSEC_PER_SEC, ltc->actual_sample_rate);
+	if (check_add_overflow(ltc->sync_reference_ns, (s64)delay_ns, ref_ns))
+		return -ERANGE;
+	return 0;
+}
+
 static u64 rk_ltc_frame_frac_q16(u64 frame_rem, u64 frame_divisor)
 {
 	return div64_u64(frame_rem * RK_LTC_PHASE_ONE, frame_divisor);
@@ -406,43 +510,39 @@ static u64 rk_ltc_expected_phase_q16(struct rk_ltc *ltc, s64 ref_ns,
 				     struct rk_ltc_timecode *tc_out)
 {
 	bool drop = ltc->cfg.flags & RK_LTC_FLAG_DROP_FRAME;
-	u64 day_ns = rk_ltc_mod_day_ns(ref_ns);
 	u64 denom = (u64)ltc->rate.codeword_den * NSEC_PER_SEC;
-	u64 prod, frame, rem, linear, frac;
-	struct rk_ltc_timecode tc = {};
-	u32 nsec;
-	u64 sec;
+	u64 rem, frac;
+	s64 sec, scaled, frame, linear, sec_rem;
+	s32 nsec;
+	s64 period = rk_ltc_frames_per_day(&ltc->rate, drop);
 
-	if (drop) {
-		sec = div_u64_rem(day_ns, NSEC_PER_SEC, &nsec);
-		tc.seconds = do_div(sec, 60);
-		tc.minutes = do_div(sec, 60);
-		tc.hours = sec % 24;
-
-		prod = (u64)nsec * ltc->rate.codeword_num;
-		frame = div64_u64_rem(prod, denom, &rem);
-		if (frame >= ltc->rate.addr_fps) {
-			frame = ltc->rate.addr_fps - 1;
-			rem = 0;
-		}
-		tc.frames = frame;
-		if (!rk_ltc_time_valid(&tc, &ltc->rate, true)) {
-			tc.frames = 2;
-			rem = 0;
-		}
-		linear = rk_ltc_tc_to_linear(&tc, &ltc->rate, true);
-		frac = rk_ltc_frame_frac_q16(rem, denom);
-	} else {
-		prod = day_ns * ltc->rate.codeword_num;
-		frame = div64_u64_rem(prod, denom, &rem);
-		div64_u64_rem(frame, rk_ltc_frames_per_day(&ltc->rate, false),
-			      &linear);
-		rk_ltc_linear_to_tc(linear, &ltc->rate, false, &tc);
-		frac = rk_ltc_frame_frac_q16(rem, denom);
+	if (!ltc->sync_epoch_valid) {
+		ltc->sync_epoch_ns = ref_ns - rk_ltc_mod_day_ns(ref_ns);
+		ltc->sync_epoch_valid = true;
 	}
 
+	/* Split first: an epoch-sized nanosecond value times 30000 overflows. */
+	sec = div_s64_rem(ref_ns, NSEC_PER_SEC, &nsec);
+	sec -= div_s64(ltc->sync_epoch_ns, NSEC_PER_SEC);
+	if (nsec < 0) {
+		sec--;
+		nsec += NSEC_PER_SEC;
+	}
+	scaled = sec * ltc->rate.codeword_num;
+	frame = div_s64(scaled, ltc->rate.codeword_den);
+	sec_rem = scaled - frame * ltc->rate.codeword_den;
+	if (sec_rem < 0) {
+		frame--;
+		sec_rem += ltc->rate.codeword_den;
+	}
+	frame += (s64)div64_u64_rem((u64)sec_rem * NSEC_PER_SEC +
+				   (u64)nsec * ltc->rate.codeword_num, denom, &rem);
+	linear = frame % period;
+	if (linear < 0)
+		linear += period;
+	frac = rk_ltc_frame_frac_q16(rem, denom);
 	if (tc_out)
-		*tc_out = tc;
+		rk_ltc_linear_to_tc(linear, &ltc->rate, drop, tc_out);
 
 	return (linear << RK_LTC_PHASE_SHIFT) + frac;
 }
@@ -469,12 +569,6 @@ static s64 rk_ltc_phase_q16_to_ns(struct rk_ltc *ltc, s64 phase)
 
 	return (s64)mul_s64_u64_shr(phase, ns_per_frame,
 				    RK_LTC_PHASE_SHIFT);
-}
-
-static u64 rk_ltc_codeword_duration_ns(const struct rk_ltc *ltc)
-{
-	return div64_u64((u64)ltc->rate.codeword_den * NSEC_PER_SEC,
-			 ltc->rate.codeword_num);
 }
 
 static s64 rk_ltc_abs64(s64 value)
@@ -556,11 +650,15 @@ static void rk_ltc_sync_reset_locked(struct rk_ltc *ltc)
 {
 	ltc->sync_correction_ppb = 0;
 	ltc->sync_integral_ppb = 0;
+	ltc->sync_integral_rem = 0;
 	ltc->sync_phase_error_ns = 0;
 	ltc->sync_updates = 0;
 	ltc->sync_locked_updates = 0;
 	ltc->sync_jump_count = 0;
 	ltc->sync_last_jump_error_ns = 0;
+	ltc->sync_observation_valid = false;
+	ltc->sync_observation_rejects = 0;
+	ltc->sync_lock_streak = 0;
 	ltc->sync_state = ltc->sync_cfg.source == RK_LTC_SYNC_SOURCE_NONE ?
 			  RK_LTC_SYNC_STATE_OFF : RK_LTC_SYNC_STATE_SLEWING;
 }
@@ -569,10 +667,10 @@ static s32 rk_ltc_sync_pll_step_locked(struct rk_ltc *ltc, s64 phase_ns)
 {
 	const struct rk_ltc_sync_config *cfg = &ltc->sync_cfg;
 	s64 error_ns = rk_ltc_clamp_pll_error(phase_ns);
-	s64 error_us, integrated_us_s;
-	s64 p_ppb, i_delta_ppb, i_ppb, correction;
+	s64 error_us, integrated;
+	s64 p_ppb, i_delta_ppb, i_ppb, i_unclamped, correction;
 	s64 max_ppb = (s64)cfg->max_slew_ppm * 1000;
-	u64 dt_ns;
+	s32 remainder;
 
 	if (cfg->pll_deadband_us &&
 	    rk_ltc_abs64(error_ns) <=
@@ -582,22 +680,29 @@ static s32 rk_ltc_sync_pll_step_locked(struct rk_ltc *ltc, s64 phase_ns)
 	error_us = div_s64(error_ns, RK_LTC_NSEC_PER_USEC);
 	p_ppb = div_s64(error_us * cfg->pll_kp_ppb_per_ms, 1000);
 
-	dt_ns = rk_ltc_codeword_duration_ns(ltc);
-	integrated_us_s = div64_s64((u64)rk_ltc_abs64(error_us) * dt_ns,
-				    NSEC_PER_SEC);
-	if (error_us < 0)
-		integrated_us_s = -integrated_us_s;
-	i_delta_ppb = div_s64(integrated_us_s *
-			      cfg->pll_ki_ppb_per_ms_s, 1000);
-
-	i_ppb = clamp_t(s64, (s64)ltc->sync_integral_ppb + i_delta_ppb,
-			-max_ppb, max_ppb);
+	/*
+	 * Integrate with the exact nominal codeword interval, retaining the
+	 * sub-ppb remainder. Rounding error_us * dt to whole us*s first would
+	 * silently disable integral correction below ~30 us at 30 fps.
+	 * The 10 s error clamp and gain/rate limits keep the numerator in s64.
+	 */
+	integrated = error_us * cfg->pll_ki_ppb_per_ms_s *
+		     ltc->rate.codeword_den + ltc->sync_integral_rem;
+	i_delta_ppb = div_s64_rem(integrated,
+				  1000 * ltc->rate.codeword_num, &remainder);
+	i_unclamped = (s64)ltc->sync_integral_ppb + i_delta_ppb;
+	i_ppb = clamp_t(s64, i_unclamped, -max_ppb, max_ppb);
+	if (i_ppb != i_unclamped)
+		remainder = 0;
 	correction = clamp_t(s64, p_ppb + i_ppb, -max_ppb, max_ppb);
 
-	if (correction != p_ppb + i_ppb)
+	if (correction != p_ppb + i_ppb) {
 		i_ppb = clamp_t(s64, correction - p_ppb, -max_ppb, max_ppb);
+		remainder = 0;
+	}
 
 	ltc->sync_integral_ppb = i_ppb;
+	ltc->sync_integral_rem = remainder;
 	ltc->sync_correction_ppb = correction;
 
 	return correction;
@@ -616,6 +721,7 @@ static void rk_ltc_sync_update_locked(struct rk_ltc *ltc)
 		ltc->sync_state = RK_LTC_SYNC_STATE_OFF;
 		ltc->sync_correction_ppb = 0;
 		ltc->sync_integral_ppb = 0;
+		ltc->sync_integral_rem = 0;
 		ltc->sync_phase_error_ns = 0;
 		return;
 	}
@@ -626,14 +732,26 @@ static void rk_ltc_sync_update_locked(struct rk_ltc *ltc)
 		return;
 	}
 
-	ret = rk_ltc_read_sync_time(cfg, &ref_ns);
+	/* Prefill has no playback position and must not drive the servo. */
+	if (!ltc->running)
+		return;
+
+	ret = rk_ltc_boundary_reference(ltc, &ref_ns);
 	if (ret) {
 		ltc->sync_state = RK_LTC_SYNC_STATE_HOLD;
-		ltc->sync_correction_ppb = 0;
+		ltc->sync_lock_streak = 0;
 		return;
 	}
 
-	ref_ns += cfg->offset_ns + rk_ltc_pipeline_latency_ns(ltc);
+	if (!ltc->sync_epoch_valid) {
+		ltc->sync_epoch_ns = ref_ns - rk_ltc_mod_day_ns(ref_ns);
+		ltc->sync_epoch_valid = true;
+	}
+	if (check_add_overflow(ref_ns, cfg->offset_ns, &ref_ns)) {
+		ltc->sync_state = RK_LTC_SYNC_STATE_HOLD;
+		ltc->sync_lock_streak = 0;
+		return;
+	}
 	expected = rk_ltc_expected_phase_q16(ltc, ref_ns, NULL);
 	current_phase = rk_ltc_tc_to_linear(&ltc->gen.tc, &ltc->rate,
 					    ltc->cfg.flags & RK_LTC_FLAG_DROP_FRAME);
@@ -658,6 +776,8 @@ static void rk_ltc_sync_update_locked(struct rk_ltc *ltc)
 		ltc->sync_jump_count++;
 		ltc->sync_last_jump_error_ns = phase_ns;
 		ltc->sync_integral_ppb = 0;
+		ltc->sync_integral_rem = 0;
+		ltc->sync_lock_streak = 0;
 	}
 
 	phase_ns = rk_ltc_phase_q16_to_ns(ltc, phase);
@@ -665,10 +785,16 @@ static void rk_ltc_sync_update_locked(struct rk_ltc *ltc)
 	rk_ltc_sync_pll_step_locked(ltc, phase_ns);
 	locked = abs_phase_ns <=
 		 (s64)cfg->lock_threshold_ms * RK_LTC_NSEC_PER_MSEC;
+	if (locked)
+		ltc->sync_lock_streak = min_t(u32, ltc->sync_lock_streak + 1,
+			DIV_ROUND_UP(ltc->rate.codeword_num, ltc->rate.codeword_den));
+	else
+		ltc->sync_lock_streak = 0;
 
 	ltc->sync_phase_error_ns = phase_ns;
-	ltc->sync_state = locked ? RK_LTC_SYNC_STATE_LOCKED :
-			   RK_LTC_SYNC_STATE_SLEWING;
+	ltc->sync_state = ltc->sync_lock_streak >=
+		DIV_ROUND_UP(ltc->rate.codeword_num, ltc->rate.codeword_den) ?
+		RK_LTC_SYNC_STATE_LOCKED : RK_LTC_SYNC_STATE_SLEWING;
 	ltc->sync_updates++;
 	if (locked)
 		ltc->sync_locked_updates++;
@@ -677,6 +803,7 @@ static void rk_ltc_sync_update_locked(struct rk_ltc *ltc)
 static int rk_ltc_sync_jam_start_locked(struct rk_ltc *ltc)
 {
 	struct rk_ltc_timecode tc;
+	u64 phase;
 	s64 ref_ns;
 	int ret;
 
@@ -689,32 +816,16 @@ static int rk_ltc_sync_jam_start_locked(struct rk_ltc *ltc)
 	if (ret)
 		return ret;
 
-	ref_ns += ltc->sync_cfg.offset_ns;
-	rk_ltc_expected_phase_q16(ltc, ref_ns, &tc);
+	ltc->sync_epoch_ns = ref_ns - rk_ltc_mod_day_ns(ref_ns);
+	ltc->sync_epoch_valid = true;
+	if (check_add_overflow(ref_ns, ltc->sync_cfg.offset_ns, &ref_ns))
+		return -ERANGE;
+	phase = rk_ltc_expected_phase_q16(ltc, ref_ns, NULL);
+	rk_ltc_phase_q16_to_nearest_tc(ltc, phase, &tc);
 	ltc->tc = tc;
 	ltc->current_tc = tc;
 
 	return 0;
-}
-
-static u64 rk_ltc_target_ns_from_tc(struct rk_ltc *ltc,
-				    const struct rk_ltc_timecode *tc)
-{
-	bool drop = ltc->cfg.flags & RK_LTC_FLAG_DROP_FRAME;
-	u64 linear, ns;
-
-	if (drop) {
-		ns = ((u64)tc->hours * 3600 + (u64)tc->minutes * 60 +
-		      tc->seconds) * NSEC_PER_SEC;
-		ns += div64_u64((u64)tc->frames * ltc->rate.codeword_den *
-				NSEC_PER_SEC, ltc->rate.codeword_num);
-		return ns % (24ULL * 60 * 60 * NSEC_PER_SEC);
-	}
-
-	linear = rk_ltc_tc_to_linear(tc, &ltc->rate, false);
-
-	return div64_u64(linear * (u64)ltc->rate.codeword_den *
-			 NSEC_PER_SEC, ltc->rate.codeword_num);
 }
 
 static int rk_ltc_sync_set_running_time_locked(struct rk_ltc *ltc,
@@ -722,32 +833,31 @@ static int rk_ltc_sync_set_running_time_locked(struct rk_ltc *ltc,
 {
 	unsigned long flags;
 	s64 ref_ns, offset;
-	u64 target_ns, ref_day_ns;
+	u64 expected, target, period;
+	bool drop = ltc->cfg.flags & RK_LTC_FLAG_DROP_FRAME;
 	int ret;
 
 	if (ltc->sync_cfg.source == RK_LTC_SYNC_SOURCE_NONE)
 		return -EBUSY;
 
-	ret = rk_ltc_read_sync_time(&ltc->sync_cfg, &ref_ns);
-	if (ret)
-		return ret;
-
-	target_ns = rk_ltc_target_ns_from_tc(ltc, tc);
-	ref_ns += rk_ltc_pipeline_latency_ns(ltc);
-	ref_day_ns = rk_ltc_mod_day_ns(ref_ns);
-	offset = (s64)target_ns - (s64)ref_day_ns;
-	offset = rk_ltc_mod_day_ns(offset);
-	if (offset > 12LL * 60 * 60 * NSEC_PER_SEC)
-		offset -= 24LL * 60 * 60 * NSEC_PER_SEC;
-
 	spin_lock_irqsave(&ltc->state_lock, flags);
+	ret = rk_ltc_observe_playback_locked(ltc);
+	if (!ret)
+		ret = rk_ltc_boundary_reference(ltc, &ref_ns);
+	if (ret)
+		goto out;
+	expected = rk_ltc_expected_phase_q16(ltc, ref_ns, NULL);
+	target = rk_ltc_tc_to_linear(tc, &ltc->rate, drop) << RK_LTC_PHASE_SHIFT;
+	period = rk_ltc_frames_per_day(&ltc->rate, drop) << RK_LTC_PHASE_SHIFT;
+	offset = rk_ltc_phase_q16_to_ns(ltc,
+			rk_ltc_phase_diff_q16(target, expected, period));
 	ltc->sync_cfg.offset_ns = offset;
-	ltc->sync_correction_ppb = 0;
-	ltc->sync_integral_ppb = 0;
+	ltc->sync_lock_streak = 0;
 	ltc->sync_state = RK_LTC_SYNC_STATE_SLEWING;
+out:
 	spin_unlock_irqrestore(&ltc->state_lock, flags);
 
-	return 0;
+	return ret;
 }
 
 static void rk_ltc_put_bcd(u8 *bits, unsigned int start,
@@ -884,8 +994,18 @@ static u8 rk_ltc_next_bmc_sample(struct rk_ltc *ltc)
 
 	while (!gen->half_remaining) {
 		if (!gen->half_index) {
-			if (!gen->bit_index)
+			if (gen->bit_index == 80) {
+				gen->bit_index = 0;
+				ltc->codewords_generated++;
+				if (ltc->cfg.mode != RK_LTC_MODE_RAW_FRAME)
+					rk_ltc_increment_time(&gen->tc, &ltc->rate,
+						ltc->cfg.flags & RK_LTC_FLAG_DROP_FRAME);
+			}
+			if (!gen->bit_index) {
+				if (ltc->cfg.mode != RK_LTC_MODE_RAW_FRAME)
+					rk_ltc_sync_update_locked(ltc);
 				rk_ltc_build_frame_bits(ltc);
+			}
 
 			gen->level ^= 1;
 			gen->half_remaining = rk_ltc_next_bmc_half(ltc);
@@ -897,15 +1017,6 @@ static u8 rk_ltc_next_bmc_sample(struct rk_ltc *ltc)
 			gen->half_remaining = rk_ltc_next_bmc_half(ltc);
 			gen->half_index = 0;
 			gen->bit_index++;
-			if (gen->bit_index == 80) {
-				gen->bit_index = 0;
-				ltc->codewords_generated++;
-				if (ltc->cfg.mode != RK_LTC_MODE_RAW_FRAME) {
-					rk_ltc_increment_time(&gen->tc, &ltc->rate,
-							      ltc->cfg.flags & RK_LTC_FLAG_DROP_FRAME);
-					rk_ltc_sync_update_locked(ltc);
-				}
-			}
 		}
 	}
 
@@ -1019,6 +1130,7 @@ static void rk_ltc_dma_callback(void *data)
 	next = (completed + 1) % ltc->periods;
 	ltc->dma_periods++;
 	ltc->current_tc = ltc->period_tc[next];
+	rk_ltc_observe_playback_locked(ltc);
 	rk_ltc_fill_period_locked(ltc, completed);
 	ltc->period_pos = next;
 
@@ -1100,6 +1212,7 @@ static int rk_ltc_start_locked(struct rk_ltc *ltc)
 	if (ret)
 		return ret;
 
+	ltc->sync_epoch_valid = false;
 	ret = rk_ltc_sync_jam_start_locked(ltc);
 	if (ret)
 		return ret;
@@ -1314,6 +1427,9 @@ static long rk_ltc_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (ret)
 			break;
 		spin_lock_irqsave(&ltc->state_lock, flags);
+		if (ltc->sync_cfg.source != sync_cfg.source ||
+		    ltc->sync_cfg.ptp_index != sync_cfg.ptp_index)
+			ltc->sync_epoch_valid = false;
 		ltc->sync_cfg = sync_cfg;
 		rk_ltc_sync_reset_locked(ltc);
 		spin_unlock_irqrestore(&ltc->state_lock, flags);
@@ -1665,8 +1781,23 @@ static int rk_ltc_debugfs_show(struct seq_file *s, void *unused)
 {
 	struct rk_ltc *ltc = s->private;
 	struct rk_ltc_status st;
+	unsigned long flags;
+	u64 output_samples, span_ns, rejects;
+	s64 reference_ns, epoch_ns;
+	u32 fifo_bytes, lock_streak;
+	bool valid;
 
 	rk_ltc_fill_status(ltc, &st);
+	spin_lock_irqsave(&ltc->state_lock, flags);
+	valid = ltc->sync_observation_valid;
+	reference_ns = ltc->sync_reference_ns;
+	output_samples = ltc->sync_output_samples;
+	span_ns = ltc->sync_observation_span_ns;
+	rejects = ltc->sync_observation_rejects;
+	fifo_bytes = ltc->sync_fifo_bytes;
+	lock_streak = ltc->sync_lock_streak;
+	epoch_ns = ltc->sync_epoch_ns;
+	spin_unlock_irqrestore(&ltc->state_lock, flags);
 	seq_printf(s, "running: %u\n", st.running);
 	seq_printf(s, "mode: %s\n", rk_ltc_mode_name(st.mode));
 	seq_printf(s, "rate: %u/%u\n", st.fps_num, st.fps_den);
@@ -1709,6 +1840,14 @@ static int rk_ltc_debugfs_show(struct seq_file *s, void *unused)
 	seq_printf(s, "sync_jump_count: %llu\n", st.sync_jump_count);
 	seq_printf(s, "sync_last_jump_error_ns: %lld\n",
 		   st.sync_last_jump_error_ns);
+	seq_printf(s, "sync_observation_valid: %u\n", valid);
+	seq_printf(s, "sync_reference_ns: %lld\n", reference_ns);
+	seq_printf(s, "sync_output_samples: %llu\n", output_samples);
+	seq_printf(s, "sync_observation_span_ns: %llu\n", span_ns);
+	seq_printf(s, "sync_observation_rejects: %llu\n", rejects);
+	seq_printf(s, "sync_fifo_bytes: %u\n", fifo_bytes);
+	seq_printf(s, "sync_lock_streak: %u\n", lock_streak);
+	seq_printf(s, "sync_epoch_ns: %lld\n", epoch_ns);
 
 	return 0;
 }
